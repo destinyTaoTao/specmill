@@ -60,7 +60,7 @@ export function ReviewPanel({ change, refresh }: { change: Change; refresh: () =
       const receipt = await readJson<{ resourceId: string }>(await fetch(`/api/v1/changes/${change.id}/review/preview`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-SpecMill-Request': '1' }, body: JSON.stringify({ requestId: requestId.current, payload: { selections: selectedRows() } }) }), '生成确认预览失败。');
       requestId.current = crypto.randomUUID();
       setPreviewId(receipt.resourceId);
-      setNotice('确认预览已生成；确认前如证据或失败处置发生变化，预览会过期。');
+      setNotice(`确认预览已生成（选中 ${selectedRows().length} 项）；确认前如证据或失败处置发生变化，预览会过期。`);
     } catch (err) { setError(err instanceof ApiError ? err.message : '预览结果未知，可重试。'); } finally { setBusy(false); }
   }
   async function confirmReview(complete: boolean) {
