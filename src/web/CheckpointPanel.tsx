@@ -8,12 +8,34 @@ type Checkpoint = { id: string; createdAt: string; actor: 'user' | 'agent'; goal
 type Context = { sessionId: string; workspaceId: string; bindingVersion: number; generation: number; version: number };
 type Draft = { done: string; failures: string; unverified: string; blockers: string; nextSteps: string };
 type Pending = { id: string; body: string; context: Context; draft: Draft; observationId: string; createdAt?: string };
+type PendingPointer = { id: string; createdAt: string };
+// full：本标签页可恢复正文并按原请求重试；pointer：正文已清除，仅可查询回执或确认后清理。
+type PendingView = { kind: 'full'; data: Pending } | { kind: 'pointer'; data: PendingPointer };
 const empty = (): Draft => ({ done: '', failures: '', unverified: '', blockers: '', nextSteps: '' });
 const fields: { key: keyof Draft; label: string }[] = [
   { key: 'done', label: '已完成' }, { key: 'failures', label: '已知失败' }, { key: 'unverified', label: '未验证' }, { key: 'blockers', label: '阻塞项' }, { key: 'nextSteps', label: '下一步' },
 ];
-function pendingKey(changeId: string, requestId: string): string {
+function storageGet(storage: Storage, key: string): string | null {
+  try { return storage.getItem(key); } catch { return null; }
+}
+function storageRemove(storage: Storage, key: string): boolean {
+  try { storage.removeItem(key); return true; } catch { return false; }
+}
+function storageKeys(storage: Storage, prefix: string): string[] {
+  try {
+    const keys: string[] = [];
+    for (let index = 0; index < storage.length; index += 1) {
+      const key = storage.key(index);
+      if (key && key.startsWith(prefix)) keys.push(key);
+    }
+    return keys;
+  } catch { return []; }
+}
+function sessionKey(changeId: string, requestId: string): string {
   return `specmill:pending-checkpoint:${changeId}:${requestId}`;
+}
+function pointerKey(changeId: string, requestId: string): string {
+  return `specmill:pending-checkpoint-request:${changeId}:${requestId}`;
 }
 function parsePending(text: string | null): Pending | null {
   if (!text) return null;
@@ -26,55 +48,82 @@ function parsePending(text: string | null): Pending | null {
     return body.requestId === value.id ? value : null;
   } catch { return null; }
 }
-function isLaterPending(value: Pending, latest: Pending): boolean {
+function parsePointer(text: string | null): PendingPointer | null {
+  if (!text) return null;
+  try {
+    const value = JSON.parse(text) as PendingPointer;
+    return typeof value.id === 'string' && typeof value.createdAt === 'string' ? value : null;
+  } catch { return null; }
+}
+function isLaterPending(value: { id: string; createdAt?: string }, latest: { id: string; createdAt?: string }): boolean {
   const valueAt = value.createdAt ?? '';
   const latestAt = latest.createdAt ?? '';
   return valueAt > latestAt || (valueAt === latestAt && value.id > latest.id);
 }
-// 每个未决请求使用独立的存储键：同一变更的多个标签页互不覆盖，确认后也只清理自身记录。
-function readLatestPending(changeId: string): Pending | null {
-  const legacyKey = `specmill:pending-checkpoint:${changeId}`;
-  try {
-    const legacy = parsePending(localStorage.getItem(legacyKey));
-    if (legacy) {
-      let migrated = false;
-      try { localStorage.setItem(pendingKey(changeId, legacy.id), JSON.stringify({ ...legacy, createdAt: legacy.createdAt ?? new Date(0).toISOString() })); migrated = true; } catch { /* 无法写入新键时保留旧副本 */ }
-      if (migrated) { try { localStorage.removeItem(legacyKey); } catch { /* 迁移副本已可用 */ } }
-    }
-  } catch { /* 站点存储不可用时跳过迁移 */ }
+function writeFull(changeId: string, pending: Pending): boolean {
+  try { sessionStorage.setItem(sessionKey(changeId, pending.id), JSON.stringify(pending)); return true; } catch { return false; }
+}
+function writePointer(changeId: string, pending: Pending): boolean {
+  try { localStorage.setItem(pointerKey(changeId, pending.id), JSON.stringify({ id: pending.id, createdAt: pending.createdAt ?? new Date(0).toISOString() })); return true; } catch { return false; }
+}
+function readLatestFull(changeId: string): Pending | null {
+  const prefix = `specmill:pending-checkpoint:${changeId}:`;
   let latest: Pending | null = null;
-  try {
-    const prefix = `${legacyKey}:`;
-    for (let index = 0; index < localStorage.length; index += 1) {
-      const key = localStorage.key(index);
-      if (!key || !key.startsWith(prefix)) continue;
-      const value = parsePending(localStorage.getItem(key));
-      if (value && (!latest || isLaterPending(value, latest))) latest = value;
-    }
-  } catch { /* 站点存储不可用时无法恢复 */ }
+  for (const key of storageKeys(sessionStorage, prefix)) {
+    const value = parsePending(storageGet(sessionStorage, key));
+    if (value && (!latest || isLaterPending(value, latest))) latest = value;
+  }
   return latest;
+}
+function readLatestPointer(changeId: string): PendingPointer | null {
+  const prefix = `specmill:pending-checkpoint-request:${changeId}:`;
+  let latest: PendingPointer | null = null;
+  for (const key of storageKeys(localStorage, prefix)) {
+    const value = parsePointer(storageGet(localStorage, key));
+    if (value && (!latest || isLaterPending(value, latest))) latest = value;
+  }
+  return latest;
+}
+// 旧版把完整正文长期保存在 localStorage；迁移为正文进会话存储、localStorage 只留请求标识指针。
+function migratePendingStorage(changeId: string): void {
+  const legacyKey = `specmill:pending-checkpoint:${changeId}`;
+  const legacy = parsePending(storageGet(localStorage, legacyKey));
+  if (legacy && writeFull(changeId, legacy)) {
+    writePointer(changeId, legacy);
+    storageRemove(localStorage, legacyKey);
+  }
+  for (const key of storageKeys(localStorage, `${legacyKey}:`)) {
+    const value = parsePending(storageGet(localStorage, key));
+    if (value && writeFull(changeId, value)) {
+      writePointer(changeId, value);
+      storageRemove(localStorage, key);
+    }
+  }
+}
+function recoverPending(changeId: string): PendingView | null {
+  migratePendingStorage(changeId);
+  const full = readLatestFull(changeId);
+  if (full) return { kind: 'full', data: full };
+  const pointer = readLatestPointer(changeId);
+  return pointer ? { kind: 'pointer', data: pointer } : null;
 }
 
 export function CheckpointPanel({ change, active, sessionReady, refresh }: { change: Change; active: Session | null; sessionReady: boolean; refresh: () => Promise<void> }) {
-  const [recovered] = useState(() => readLatestPending(change.id));
+  const [recovered] = useState(() => recoverPending(change.id));
   const [history, setHistory] = useState<Checkpoint[] | null>(null);
-  const [context, setContext] = useState<Context | null>(recovered?.context ?? null);
+  const [context, setContext] = useState<Context | null>(recovered?.kind === 'full' ? recovered.data.context : null);
   const [observations, setObservations] = useState<Observation[]>([]);
   const [observationSequence, setObservationSequence] = useState(0);
-  const [observationId, setObservationId] = useState(recovered?.observationId ?? '');
-  const [draft, setDraft] = useState<Draft>(recovered?.draft ?? empty);
+  const [observationId, setObservationId] = useState(recovered?.kind === 'full' ? recovered.data.observationId : '');
+  const [draft, setDraft] = useState<Draft>(recovered?.kind === 'full' ? recovered.data.draft : empty);
   const [busy, setBusy] = useState(false);
   const [needsReload, setNeedsReload] = useState(false);
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
-  const [pending, setPending] = useState<Pending | null>(recovered);
+  const [pending, setPending] = useState<PendingView | null>(recovered);
   const [receiptMissing, setReceiptMissing] = useState(false);
   const requestId = useRef(crypto.randomUUID());
   const validContext = !!context && !!active && context.sessionId === active.id && context.generation === active.generation && context.bindingVersion === active.bindingVersion && context.version === change.version && sessionReady;
-  function discard(command: Pending): Pending | null {
-    try { localStorage.removeItem(pendingKey(change.id, command.id)); return readLatestPending(change.id); }
-    catch { return command; }
-  }
   useEffect(() => {
     let live = true;
     void fetch(`/api/v1/changes/${change.id}/checkpoints`).then(response => readJson<{ checkpoints: Checkpoint[] }>(response, '读取保存点失败。'))
@@ -96,14 +145,26 @@ export function CheckpointPanel({ change, active, sessionReady, refresh }: { cha
     setContext({ sessionId: active.id, workspaceId: active.workspaceId, bindingVersion: active.bindingVersion, generation: active.generation, version: change.version });
     requestId.current = crypto.randomUUID();
   }
-  async function complete(command: Pending) {
+  function discard(entry: PendingView): PendingView | null {
+    try {
+      if (entry.kind === 'full') storageRemove(sessionStorage, sessionKey(change.id, entry.data.id));
+      storageRemove(localStorage, pointerKey(change.id, entry.data.id));
+      return recoverPending(change.id);
+    } catch { return entry; }
+  }
+  async function complete(entry: PendingView) {
     let removed = true;
-    try { localStorage.removeItem(pendingKey(change.id, command.id)); } catch { removed = false; }
+    try {
+      if (entry.kind === 'full') storageRemove(sessionStorage, sessionKey(change.id, entry.data.id));
+      if (!storageRemove(localStorage, pointerKey(change.id, entry.data.id))) removed = false;
+    } catch { removed = false; }
     // 只清理本请求的记录；若浏览器中还有其他未决请求，恢复最新一条继续核对。
-    const next = removed ? readLatestPending(change.id) : null;
+    const next = removed ? recoverPending(change.id) : null;
     requestId.current = crypto.randomUUID();
     if (next) {
-      setDraft(next.draft); setObservationId(next.observationId); setContext(next.context); setPending(next);
+      if (next.kind === 'full') { setDraft(next.data.draft); setObservationId(next.data.observationId); setContext(next.data.context); }
+      else { setDraft(empty()); setObservationId(''); setContext(null); }
+      setPending(next);
     } else {
       setDraft(empty()); setObservationId(''); setContext(null); setPending(null);
     }
@@ -116,13 +177,13 @@ export function CheckpointPanel({ change, active, sessionReady, refresh }: { cha
     try {
       const receipt = await readJson<{ requestId?: string; resourceId?: string; recordVersion?: number; committedAt?: string }>(await fetch(`/api/v1/changes/${change.id}/checkpoints`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-SpecMill-Request': '1' }, body: command.body }), '保存进度失败。');
       if (receipt.requestId !== command.id || !receipt.resourceId || typeof receipt.recordVersion !== 'number' || !receipt.committedAt) throw new Error('Invalid receipt');
-      await complete(command);
+      await complete({ kind: 'full', data: command });
     } catch (err) {
       if (wasPending || !(err instanceof ApiError) || !err.status || err.status >= 500) {
-        setPending(command); setReceiptMissing(false);
+        setPending({ kind: 'full', data: command }); setReceiptMissing(false);
         setError('保存结果未知；请先查询回执或按原请求重试，输入已保留。');
       } else {
-        setPending(discard(command));
+        setPending(discard({ kind: 'full', data: command }));
         setError(err.message);
       }
       if (err instanceof ApiError && err.code === 'VERSION_CONFLICT') { try { await refresh(); } catch { /* preserve the draft */ } }
@@ -133,19 +194,24 @@ export function CheckpointPanel({ change, active, sessionReady, refresh }: { cha
     if (!context || !validContext || pending) return;
     const id = requestId.current;
     const command = { id, body: JSON.stringify({ requestId: id, expectedVersion: context.version, writerSessionId: context.sessionId, generation: context.generation, payload: { ...draft, observationId } }), context, draft, observationId, createdAt: new Date().toISOString() };
-    try { localStorage.setItem(pendingKey(change.id, id), JSON.stringify(command)); }
-    catch { setError('无法在浏览器临时保存未决请求，请检查站点存储设置。'); return; }
-    setPending(command);
+    // 正文只写进本标签页的会话存储；localStorage 仅保留请求标识指针，用于在标签页关闭后核对结果。
+    if (!writePointer(change.id, command)) { setError('无法在浏览器保存请求标识，请检查站点存储设置。'); return; }
+    if (!writeFull(change.id, command)) { setError('无法在本标签页保存未决正文，请检查站点存储设置。'); storageRemove(localStorage, pointerKey(change.id, id)); return; }
+    setPending({ kind: 'full', data: command });
     await attempt(command, false);
   }
   async function checkReceipt() {
     if (!pending) return;
     setBusy(true); setError('');
     try {
-      const response = await fetch(`/api/v1/receipts/${encodeURIComponent(pending.id)}`);
-      if (response.status === 404) { setReceiptMissing(true); setError('目前没有找到回执；原请求仍可能在途，可按原请求重试。'); return; }
+      const response = await fetch(`/api/v1/receipts/${encodeURIComponent(pending.data.id)}`);
+      if (response.status === 404) {
+        setReceiptMissing(true);
+        setError(pending.kind === 'full' ? '目前没有找到回执；原请求仍可能在途，可按原请求重试。' : '目前没有找到回执；原请求仍可能在途，请稍后再查询。');
+        return;
+      }
       const receipt = await readJson<{ requestId?: string; resourceId?: string; recordVersion?: number; committedAt?: string }>(response, '查询回执失败。');
-      if (receipt.requestId !== pending.id || !receipt.resourceId || typeof receipt.recordVersion !== 'number' || !receipt.committedAt) throw new Error('Invalid receipt');
+      if (receipt.requestId !== pending.data.id || !receipt.resourceId || typeof receipt.recordVersion !== 'number' || !receipt.committedAt) throw new Error('Invalid receipt');
       await complete(pending);
     } catch { setError('无法确认保存结果，请稍后查询或按原请求重试。'); } finally { setBusy(false); }
   }
@@ -153,11 +219,16 @@ export function CheckpointPanel({ change, active, sessionReady, refresh }: { cha
     {notice && <p>{notice}</p>}
     <p>保存工作台记录不等于备份源码或完成验收。</p>
     {history === null ? <p>正在读取保存点。</p> : history.length === 0 ? <p>尚无保存点，可在关键节点记录进度。</p> : <details><summary>保存点历史（{history.length}）</summary>{history.map(item => <article key={item.id}><p>{item.createdAt} · {item.actor === 'user' ? '用户' : '工具'} · {item.baselineId ? `冻结基线 ${item.baselineId}` : `未确认草案修订 ${item.draftRevisionId}`}</p><p>观察：{item.observationCreatedAt} · {item.observationPath} · 绑定版本 {item.observationBindingVersion} · {item.observationId} {item.observationStable ? '' : '（观察不稳定）'}</p><ul>{item.observationLimitations.map((value, index) => <li key={index}>{value}</li>)}</ul><p>目标：{item.goal.trim() ? item.goal : '尚未填写'}</p><p>已完成：{item.done}</p><p>失败：{item.failures}</p><p>未验证：{item.unverified}</p><p>阻塞：{item.blockers}</p><p>下一步：{item.nextSteps}</p></article>)}</details>}
-    {!context && <button disabled={!active || !sessionReady || needsReload} onClick={begin}>填写保存点</button>}
+    {!context && <button disabled={!active || !sessionReady || needsReload || !!pending} onClick={begin}>填写保存点</button>}
+    {pending && <div>{pending.kind === 'full'
+      ? <p>待确认请求：{pending.data.id}。正文只保存在本标签页的会话存储中，关闭标签页即清除；本浏览器另保留请求标识用于核对结果，确认后清除。不包含写授权凭据。</p>
+      : <p>待确认请求：{pending.data.id}。该请求的正文未保留，本浏览器只保留请求标识用于核对结果，不包含写授权凭据。</p>}
+      <button type="button" disabled={busy} onClick={() => { void checkReceipt(); }}>查询保存回执</button>
+      {pending.kind === 'full' && <button type="button" disabled={busy} onClick={() => { void attempt(pending.data, true); }}>按原请求重试</button>}
+      {receiptMissing && <button type="button" disabled={busy} onClick={() => { const next = discard(pending); setPending(next); setReceiptMissing(false); setError(next === pending ? '无法清理浏览器临时记录，请稍后重试。' : pending.kind === 'full' ? '请确认原请求已结束，核对后再使用新版本保存。' : '已清理该请求的浏览器记录，请核对后再使用新版本保存。'); }}>{pending.kind === 'full' ? '确认原请求已结束并重新核对' : '确认原请求已结束并清理'}</button>}</div>}
     {context && <form aria-label="保存点" onSubmit={save}><p>没有相关内容时请填写“无”或“未知”。</p>
       {!validContext && <p role="alert">会话或变更版本已变化，输入仍保留；请先核对最新状态。</p>}
       {!validContext && !pending && active && sessionReady && <button type="button" onClick={begin}>已核对，使用当前会话与版本</button>}
-      {pending && <div><p>待确认请求：{pending.id}。正文临时保存在本浏览器，确认结果后清除；不包含写授权凭据。</p><button type="button" disabled={busy} onClick={() => { void checkReceipt(); }}>查询保存回执</button><button type="button" disabled={busy} onClick={() => { void attempt(pending, true); }}>按原请求重试</button>{receiptMissing && <button type="button" disabled={busy} onClick={() => { const next = discard(pending); setPending(next); setReceiptMissing(false); setError(next === pending ? '无法清理浏览器临时记录，请稍后重试。' : '请确认原请求已结束，核对后再使用新版本保存。'); }}>确认原请求已结束并重新核对</button>}</div>}
       <label>工作区观察<select disabled={busy || needsReload || !!pending} required value={observationId} onChange={event => { setObservationId(event.target.value); requestId.current = crypto.randomUUID(); }}><option value="">请选择观察记录</option>{observations.map(item => <option key={item.id} value={item.id}>{item.createdAt} · {item.path}{item.stable ? '' : '（观察不稳定）'}</option>)}</select></label>
       <button type="button" disabled={busy || needsReload} onClick={() => setObservationSequence(value => value + 1)}>刷新观察列表</button>
       {observations.length === 0 && <p>请先在工作区执行观察，再刷新观察列表。</p>}

@@ -47,7 +47,7 @@ test('a user starts and releases a manual writer session', async ({ page }) => {
     await expect(page.getByRole('alert')).toContainText('保存结果未知');
     await expect(checkpoint.getByLabel('下一步')).toHaveValue('继续排查');
     await page.unroute('**/api/v1/changes/*/checkpoints');
-    await checkpoint.getByRole('button', { name: '按原请求重试' }).click();
+    await page.getByRole('button', { name: '按原请求重试' }).click();
     await page.getByText('保存点历史（1）').click();
     await expect(page.getByText('失败：测试暂时失败')).toBeVisible();
     await page.getByRole('button', { name: '填写保存点' }).click();
