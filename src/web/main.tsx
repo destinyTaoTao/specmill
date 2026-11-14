@@ -81,6 +81,34 @@ function WorkspaceCard({ workspace, projectId, onChanged }: { workspace: Workspa
   </section>;
 }
 
+type ExportOperation = { id: string; status: string; sha256: string | null; size: number | null; error: string | null; createdAt: string; finishedAt: string | null };
+
+function ExportSection({ projectId }: { projectId: string }) {
+  const [exports, setExports] = useState<ExportOperation[] | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const [notice, setNotice] = useState('');
+  const requestId = useRef(crypto.randomUUID());
+  const reload = async () => {
+    const result = await readJson<{ exports: ExportOperation[] }>(await fetch(`/api/v1/projects/${projectId}/exports`), '读取导出记录失败。');
+    setExports(result.exports);
+  };
+  useEffect(() => { let live = true; void reload().catch(() => { if (live) setError('读取导出记录失败。'); }); return () => { live = false; }; }, [projectId]);
+  async function startExport() {
+    setBusy(true); setError(''); setNotice('');
+    try {
+      const receipt = await readJson<{ resourceId: string; status: string }>(await fetch(`/api/v1/projects/${projectId}/exports`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-SpecMill-Request': '1' }, body: JSON.stringify({ requestId: requestId.current }) }), '导出失败。');
+      requestId.current = crypto.randomUUID();
+      await reload();
+      setNotice(receipt.status === 'ready' ? '恢复包已生成，可下载。' : '导出未完成，请查看操作状态。');
+    } catch (err) { setError(err instanceof ApiError ? err.message : '导出结果未知，可重试。'); } finally { setBusy(false); }
+  }
+  return <section><h3>导出恢复包</h3>{error && <p role="alert">{error}</p>}{notice && <p>{notice}</p>}
+    <button disabled={busy} onClick={() => { void startExport(); }}>导出恢复包</button>
+    {exports === null ? <p>正在读取导出记录。</p> : exports.length === 0 ? <p>尚无导出记录。</p> : <ul>{exports.map(item => <li key={item.id}><p>操作 {item.id.slice(0, 8)}… · {item.status === 'ready' ? '已就绪' : item.status === 'failed' ? `失败：${item.error ?? ''}` : item.status} · {item.createdAt}</p>{item.status === 'ready' && <p><a href={`/api/v1/exports/${item.id}/download`}>下载恢复包</a>（{item.size} 字节）</p>}</li>)}</ul>}
+  </section>;
+}
+
 function ProjectDetails({ project, onBack }: { project: Project; onBack: () => void }) {
   const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
   const [capacity, setCapacity] = useState<Capacity | null>(null);
@@ -113,6 +141,7 @@ function ProjectDetails({ project, onBack }: { project: Project; onBack: () => v
     <form onSubmit={bind}><label>工作目录<input disabled={busy} value={path} onChange={event => { setPath(event.target.value); requestId.current = crypto.randomUUID(); }} required /></label><button disabled={busy}>登记工作区</button></form>
     {workspaces.map(workspace => <WorkspaceCard key={workspace.id} workspace={workspace} projectId={project.id} onChanged={refresh} />)}
     <ChangeDrafts projectId={project.id} workspaces={workspaces} onChanged={refresh} />
+    <ExportSection projectId={project.id} />
   </>;
 }
 function App() {

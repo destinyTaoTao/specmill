@@ -13,6 +13,7 @@ import { registerCheckpoints } from './features/checkpoints.js';
 import { registerHandoffs } from './features/handoffs.js';
 import { registerEvidence } from './features/evidence.js';
 import { registerReview } from './features/review.js';
+import { registerRecovery } from './features/recovery.js';
 import { checkProjectCapacity, DEFAULT_RECORDS_LIMIT, ProjectCapacityExceeded } from './storage/project-capacity.js';
 import { requestIdUsedElsewhere } from './storage/request-ids.js';
 
@@ -38,7 +39,7 @@ export async function buildApp(options: AppOptions) {
     const version = (db.prepare('select sqlite_version() as version').get() as {version: string}).version.split('.').map(Number);
     if (version[0] < 3 || (version[0] === 3 && (version[1] < 51 || (version[1] === 51 && version[2] < 3)))) throw new Error('SQLite 3.51.3 or later required');
     const schemaVersion = db.pragma('user_version', { simple: true }) as number;
-    if (schemaVersion > 14) throw new Error('Unsupported database schema');
+    if (schemaVersion > 15) throw new Error('Unsupported database schema');
     db.pragma('journal_mode = WAL'); db.pragma('locking_mode = EXCLUSIVE'); db.pragma('foreign_keys = ON'); db.pragma('synchronous = FULL'); db.pragma('busy_timeout = 5000');
     db.exec('BEGIN EXCLUSIVE; COMMIT');
     if (schemaVersion === 0) db.transaction(() => {
@@ -223,9 +224,22 @@ export async function buildApp(options: AppOptions) {
           PRAGMA user_version = 14`);
       })();
     }
+    if (schemaVersion < 15) {
+      if (schemaVersion === 14) {
+        const backupDir = join(dir, 'backups');
+        await mkdir(backupDir, { recursive: true });
+        await db.backup(join(backupDir, `before-schema-15-${randomUUID()}.db`));
+      }
+      db.transaction(() => {
+        db!.exec(`CREATE TABLE export_operations (id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id), request_id TEXT NOT NULL UNIQUE, status TEXT NOT NULL, sha256 TEXT, size INTEGER, error TEXT, created_at TEXT NOT NULL, finished_at TEXT);
+          PRAGMA user_version = 15`);
+      })();
+    }
     db.transaction(() => {
       db!.exec("UPDATE changes SET version = version + 1 WHERE id IN (SELECT change_id FROM writer_sessions WHERE status = 'active')");
       db!.prepare("UPDATE writer_sessions SET status = 'interrupted', ended_at = ? WHERE status = 'active'").run(new Date().toISOString());
+      // 重启后未完成的导出准备标为失败：半成品不作为可恢复包发布。
+      db!.prepare("UPDATE export_operations SET status = 'failed', error = '服务重启中断了导出准备', finished_at = ? WHERE status = 'preparing'").run(new Date().toISOString());
     })();
     const app = Fastify({ logger: { level: 'error' }, logController: new LogController({ disableRequestLogging: true }), bodyLimit: 1024 * 1024, genReqId: () => randomUUID(), ajv: { customOptions: { removeAdditional: false, coerceTypes: false } }, forceCloseConnections: true });
     // 附件二进制正文：按内容寻址存储，单文件上限在路由上收紧。
@@ -254,7 +268,7 @@ export async function buildApp(options: AppOptions) {
       const agent = !!bearer && equal(bearer, options.agentToken);
       if (!owner && !agent) return sendError(request, reply, 401, 'UNAUTHORIZED', '请先登录工作台。');
       if (request.method !== 'GET') {
-        const agentRoute = request.method === 'POST' && (route === '/api/v1/changes/:changeId/writer-sessions' || route === '/api/v1/writer-sessions/:sessionId/release' || route === '/api/v1/changes/:changeId/checkpoints' || route === '/api/v1/workspaces/:workspaceId/observations' || route === '/api/v1/changes/:changeId/handoffs' || route === '/api/v1/changes/:changeId/executions' || route === '/api/v1/changes/:changeId/evidence' || route === '/api/v1/changes/:changeId/acceptance-targets' || route === '/api/v1/changes/:changeId/acceptance-proposals' || route === '/api/v1/projects/:projectId/attachments' || route === '/api/v1/changes/:changeId/review/preview' || route === '/api/v1/changes/:changeId/review/failure-dispositions/preview');
+        const agentRoute = request.method === 'POST' && (route === '/api/v1/changes/:changeId/writer-sessions' || route === '/api/v1/writer-sessions/:sessionId/release' || route === '/api/v1/changes/:changeId/checkpoints' || route === '/api/v1/workspaces/:workspaceId/observations' || route === '/api/v1/changes/:changeId/handoffs' || route === '/api/v1/changes/:changeId/executions' || route === '/api/v1/changes/:changeId/evidence' || route === '/api/v1/changes/:changeId/acceptance-targets' || route === '/api/v1/changes/:changeId/acceptance-proposals' || route === '/api/v1/projects/:projectId/attachments' || route === '/api/v1/projects/:projectId/exports' || route === '/api/v1/changes/:changeId/review/preview' || route === '/api/v1/changes/:changeId/review/failure-dispositions/preview');
         if (owner ? !requestOrigin || request.headers['x-specmill-request'] !== '1' : !agent || !agentRoute) return sendError(request, reply, 403, 'FORBIDDEN', '没有执行此操作的权限。');
       }
     });
@@ -296,6 +310,7 @@ export async function buildApp(options: AppOptions) {
     registerHandoffs(app, db, recordsLimit);
     registerEvidence(app, db, recordsLimit, join(dir, 'attachments'));
     registerReview(app, db, recordsLimit, join(dir, 'attachments'));
+    registerRecovery(app, db, dir, isOwner);
     app.setErrorHandler((error, request, reply) => {
       if (error instanceof ProjectCapacityExceeded) return reply.code(413).send({ code: error.code, message: error.message, requestId: request.id, dimension: error.dimension, used: error.used, requestedIncrement: error.requestedIncrement, limit: error.limit });
       const errorStatus = typeof error === 'object' && error !== null && 'statusCode' in error ? error.statusCode : undefined;
