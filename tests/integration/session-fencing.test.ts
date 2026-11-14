@@ -143,4 +143,54 @@ describe('writer sessions', () => {
     expect(release.statusCode).toBe(200);
     expect((await app.inject({ method: 'POST', url: `/api/v1/projects/${projectId}/workspaces`, headers: ownerHeaders, payload: rebindBody })).statusCode).toBe(200);
   }, 15000);
+
+  it('takes over near the capacity limit and rolls back atomically when the increment does not fit', async () => {
+    const { app, projectId, workspaceId, changeId, ownerHeaders } = await setup(8000);
+    const started = await start(app, changeId, workspaceId, 'bounded-start');
+    expect(started.statusCode).toBe(201);
+    const capacity = async () => (await app.inject({ url: `/api/v1/projects/${projectId}/capacity`, headers: ownerHeaders })).json().records as { used: number; limit: number };
+    const remaining = async () => { const budget = await capacity(); return budget.limit - budget.used; };
+    const fill = async (tag: string, goalLength: number) => {
+      const result = await app.inject({ method: 'POST', url: `/api/v1/projects/${projectId}/changes`, headers: ownerHeaders,
+        payload: { requestId: `fill-${tag}`, expectedVersion: null, payload: { title: '容量填充', goal: 'x'.repeat(goalLength), scope: '', nonGoals: '', criteria: [] } } });
+      expect(result.statusCode).toBe(201);
+    };
+    const takeover = (requestId: string, session: { resourceId: string }, generation: number, expectedVersion: number) =>
+      app.inject({ method: 'POST', url: `/api/v1/changes/${changeId}/writer-sessions/takeover`, headers: ownerHeaders,
+        payload: { requestId, expectedVersion, payload: { writerSessionId: session.resourceId, expectedGeneration: generation, expectedCheckpointId: null, toolLabel: '接管' } } });
+    // 先测量一次最小变更的容量增量，再校准填充到剩余约 1800 字节
+    const beforeProbe = await capacity();
+    await fill('0000', 0);
+    const perFill = (await capacity()).used - beforeProbe.used;
+    await fill('0001', Math.max(0, Math.floor((await remaining() - 1800 - perFill) / 2)));
+    const beforeTakeover = await remaining();
+    expect(beforeTakeover).toBeGreaterThan(0);
+    // 接管前后都占用一个活跃会话：接近上限时接管仍应成功
+    const nearLimit = await takeover('near-limit-takeover', started.json(), 1, 2);
+    expect(nearLimit.statusCode).toBe(201);
+    const second = nearLimit.json();
+    expect(second.generation).toBe(2);
+    const increment = beforeTakeover - await remaining();
+    // 填充到剩余不足一次接管的开销（旧会话历史、新会话与回执）后应 413
+    const gap = await remaining();
+    if (gap >= perFill) {
+      const extra = gap - perFill - Math.floor(increment / 2);
+      await fill('0002', extra >= 0 ? Math.floor(extra / 2) : 0);
+    }
+    expect(await remaining()).toBeLessThan(increment);
+    const rejected = await takeover('tight-takeover', second, 2, 3);
+    expect(rejected.statusCode).toBe(413);
+    expect(rejected.json()).toEqual(expect.objectContaining({ code: 'PROJECT_CAPACITY_EXCEEDED', dimension: 'records', limit: 8000 }));
+    // 回执未记录、会话历史与变更版本未前进，撤销是原子的
+    expect((await app.inject({ url: '/api/v1/receipts/tight-takeover', headers: ownerHeaders })).statusCode).toBe(404);
+    const history = await app.inject({ url: `/api/v1/changes/${changeId}/writer-sessions`, headers: agentHeaders });
+    expect(history.json().sessions).toEqual([
+      expect.objectContaining({ id: second.resourceId, generation: 2, status: 'active' }),
+      expect.objectContaining({ id: started.json().resourceId, generation: 1, status: 'taken_over' }),
+    ]);
+    // 释放由活跃会话预留保证可行，用户在回滚后仍有恢复路径
+    const release = await app.inject({ method: 'POST', url: `/api/v1/writer-sessions/${second.resourceId}/release`, headers: ownerHeaders,
+      payload: { requestId: 'after-rejected-release', expectedVersion: 3, generation: 2 } });
+    expect(release.statusCode).toBe(200);
+  }, 20000);
 });
