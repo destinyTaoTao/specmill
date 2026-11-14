@@ -6,11 +6,12 @@ import { join } from 'node:path';
 import { projectRecords } from '../storage/project-capacity.js';
 import { requestIdUsedElsewhere } from '../storage/request-ids.js';
 import { buildZip, type ZipEntry } from '../recovery/zip.js';
+import { restoreFromPackage } from '../recovery/import.js';
 
 const EXPORT_DEADLINE_MS = 300 * 1000;
 type Operation = { id: string; projectId: string; status: string; sha256: string | null; size: number | null; error: string | null; createdAt: string; finishedAt: string | null; deadlineAt: string | null };
 
-export function registerRecovery(app: FastifyInstance, db: Database.Database, dataDir: string, isOwner: (request: FastifyRequest) => boolean) {
+export function registerRecovery(app: FastifyInstance, db: Database.Database, dataDir: string, recordsLimit: number, isOwner: (request: FastifyRequest) => boolean) {
   const attachmentsDir = join(dataDir, 'attachments');
   const exportsDir = join(dataDir, 'exports');
   const getOperationRow = (operationId: string) => db.prepare('SELECT id, project_id AS projectId, status, sha256, size, error, created_at AS createdAt, finished_at AS finishedAt, deadline_at AS deadlineAt FROM export_operations WHERE id = ?').get(operationId) as (Operation & { id: string }) | undefined;
@@ -91,7 +92,23 @@ export function registerRecovery(app: FastifyInstance, db: Database.Database, da
     return reply.code(201).send({ requestId, resourceId: operationId, status: 'preparing', createdAt: committedAt, deadlineAt });
   });
 
-  app.get<{ Params: { projectId: string } }>('/api/v1/projects/:projectId/exports', async (request, reply) => {
+  app.post<{ Params: Record<string, never>; Querystring: { requestId: string }; Body: Buffer }>('/api/v1/restore', {
+    bodyLimit: 64 * 1024 * 1024,
+    schema: { querystring: { type: 'object', required: ['requestId'], additionalProperties: false, properties: { requestId: { type: 'string', minLength: 1, maxLength: 128 } } } },
+  }, async (request, reply) => {
+    const { requestId } = request.query;
+    if (db.prepare('SELECT 1 FROM export_operations WHERE request_id = ?').get(requestId)) return reply.code(409).send({ code: 'REQUEST_ID_CONFLICT', message: '请求标识已用于不同的内容。', requestId: request.id });
+    const zip = request.body as Buffer;
+    if (!Buffer.isBuffer(zip) || zip.length === 0) return reply.code(400).send({ code: 'INVALID_PACKAGE', message: '恢复包内容为空。', requestId: request.id });
+    const result = await restoreFromPackage(db, attachmentsDir, zip, recordsLimit);
+    if ('code' in result) {
+      const status = result.code === 'PROJECT_EXISTS' || result.code === 'SCHEMA_VERSION_MISMATCH' || result.code === 'UNSUPPORTED_FORMAT' ? 409 : result.code === 'PROJECT_CAPACITY_EXCEEDED' ? 413 : 400;
+      return reply.code(status).send({ code: result.code, message: result.message, requestId: request.id });
+    }
+    return reply.code(201).send({ requestId, resourceId: result.projectId, restoredProjectId: result.projectId, sourceBindingRequired: true, counts: result.counts });
+  });
+
+    app.get<{ Params: { projectId: string } }>('/api/v1/projects/:projectId/exports', async (request, reply) => {
     if (!db.prepare('SELECT 1 FROM projects WHERE id = ?').get(request.params.projectId)) return reply.code(404).send({ code: 'NOT_FOUND', message: '项目不存在。', requestId: request.id });
     const rows = db.prepare('SELECT id, status, sha256, size, error, created_at AS createdAt, finished_at AS finishedAt, deadline_at AS deadlineAt FROM export_operations WHERE project_id = ? ORDER BY created_at DESC, id DESC').all(request.params.projectId) as Operation[];
     return { exports: await Promise.all(rows.map(row => prepareOperation(row))) };

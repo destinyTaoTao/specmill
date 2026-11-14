@@ -32,7 +32,12 @@ export async function buildApp(options: AppOptions) {
   if (!Number.isSafeInteger(recordsLimit) || recordsLimit <= 0) throw new Error('Invalid project capacity limit');
   await mkdir(options.dataDir, { recursive: true });
   const dir = await realpath(options.dataDir);
-  const unlock = await lockfile.lock(dir, { realpath: false, stale: 10000, retries: 0 });
+  let unlock: () => Promise<void>;
+  try {
+    unlock = await lockfile.lock(dir, { realpath: false, stale: 10000, retries: 0 });
+  } catch (error) {
+    throw new Error(`数据目录锁获取失败（${dir}）：${error instanceof Error ? error.message : String(error)}`);
+  }
   let db: Database.Database | undefined;
   try {
     db = new Database(join(dir, 'specmill.db'));
@@ -320,7 +325,7 @@ export async function buildApp(options: AppOptions) {
     registerHandoffs(app, db, recordsLimit);
     registerEvidence(app, db, recordsLimit, join(dir, 'attachments'));
     registerReview(app, db, recordsLimit, join(dir, 'attachments'));
-    registerRecovery(app, db, dir, isOwner);
+    registerRecovery(app, db, dir, recordsLimit, isOwner);
     app.setErrorHandler((error, request, reply) => {
       if (error instanceof ProjectCapacityExceeded) return reply.code(413).send({ code: error.code, message: error.message, requestId: request.id, dimension: error.dimension, used: error.used, requestedIncrement: error.requestedIncrement, limit: error.limit });
       const errorStatus = typeof error === 'object' && error !== null && 'statusCode' in error ? error.statusCode : undefined;

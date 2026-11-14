@@ -72,3 +72,47 @@ export function buildZip(entries: ZipEntry[]): Buffer {
   eocd.writeUInt16LE(0, 20);
   return Buffer.concat([...localParts, ...centralParts, eocd]);
 }
+
+export class ZipFormatError extends Error {}
+const MAX_ENTRY_BYTES = 64 * 1024 * 1024;
+const MAX_ENTRIES = 20000;
+
+// 严格解析 STORE ZIP：仅接受本工具生成的结构；拒绝压缩方法、路径穿越、
+// 异常规模与签名不符的内容。
+export function parseZip(zip: Buffer, allowedName: (name: string) => boolean): Map<string, Buffer> {
+  let eocdOffset = -1;
+  for (let index = zip.length - 22; index >= Math.max(0, zip.length - 70000); index--) {
+    if (zip.readUInt32LE(index) === 0x06054b50) { eocdOffset = index; break; }
+  }
+  if (eocdOffset < 0) throw new ZipFormatError('ZIP 结束记录缺失。');
+  const entryCount = zip.readUInt16LE(eocdOffset + 8);
+  const declaredCount = zip.readUInt16LE(eocdOffset + 10);
+  if (entryCount !== declaredCount || entryCount > MAX_ENTRIES) throw new ZipFormatError('ZIP 文件项数异常。');
+  const centralOffset = zip.readUInt32LE(eocdOffset + 16);
+  if (centralOffset > zip.length) throw new ZipFormatError('ZIP 中央目录越界。');
+  const entries = new Map<string, Buffer>();
+  let cursor = centralOffset;
+  for (let index = 0; index < entryCount; index++) {
+    if (cursor + 46 > zip.length || zip.readUInt32LE(cursor) !== 0x02014b50) throw new ZipFormatError('ZIP 中央目录损坏。');
+    const method = zip.readUInt16LE(cursor + 10);
+    const compressedSize = zip.readUInt32LE(cursor + 20);
+    const nameLength = zip.readUInt16LE(cursor + 28);
+    const extraLength = zip.readUInt16LE(cursor + 30);
+    const commentLength = zip.readUInt16LE(cursor + 32);
+    const localOffset = zip.readUInt32LE(cursor + 42);
+    if (method !== 0) throw new ZipFormatError('ZIP 仅支持不压缩的条目。');
+    const name = zip.slice(cursor + 46, cursor + 46 + nameLength).toString('utf8');
+    if (!allowedName(name)) throw new ZipFormatError(`ZIP 包含不允许的文件项：${name}`);
+    if (entries.has(name)) throw new ZipFormatError(`ZIP 包含重复文件项：${name}`);
+    if (localOffset + 30 > zip.length || zip.readUInt32LE(localOffset) !== 0x04034b50) throw new ZipFormatError('ZIP 本地头损坏。');
+    const localNameLength = zip.readUInt16LE(localOffset + 26);
+    const dataStart = localOffset + 30 + localNameLength;
+    if (dataStart + compressedSize > zip.length) throw new ZipFormatError('ZIP 条目数据越界。');
+    const data = zip.slice(dataStart, dataStart + compressedSize);
+    if (data.length > MAX_ENTRY_BYTES) throw new ZipFormatError('ZIP 条目超过大小限制。');
+    if (crc32(data) !== zip.readUInt32LE(cursor + 16)) throw new ZipFormatError(`ZIP 条目摘要不符：${name}`);
+    entries.set(name, Buffer.from(data));
+    cursor += 46 + nameLength + extraLength + commentLength;
+  }
+  return entries;
+}
