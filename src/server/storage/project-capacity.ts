@@ -24,6 +24,8 @@ export function projectRecords(db: Database.Database, projectId: string) {
     writerSessionRequests: db.prepare('SELECT r.* FROM writer_session_requests r JOIN writer_sessions s ON s.id = r.session_id JOIN changes c ON c.id = s.change_id WHERE c.project_id = ? ORDER BY r.request_id').all(projectId),
     checkpoints: db.prepare('SELECT p.* FROM checkpoints p JOIN changes c ON c.id = p.change_id WHERE c.project_id = ? ORDER BY p.id').all(projectId),
     checkpointRequests: db.prepare('SELECT r.* FROM checkpoint_requests r JOIN checkpoints p ON p.id = r.checkpoint_id JOIN changes c ON c.id = p.change_id WHERE c.project_id = ? ORDER BY r.request_id').all(projectId),
+    handoffSnapshots: db.prepare('SELECT s.* FROM handoff_snapshots s JOIN changes c ON c.id = s.change_id WHERE c.project_id = ? ORDER BY s.id').all(projectId),
+    handoffRequests: db.prepare('SELECT r.* FROM handoff_requests r JOIN handoff_snapshots s ON s.id = r.snapshot_id JOIN changes c ON c.id = s.change_id WHERE c.project_id = ? ORDER BY r.request_id').all(projectId),
   };
 }
 

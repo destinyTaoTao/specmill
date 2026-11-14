@@ -10,6 +10,7 @@ import { registerChanges } from './features/changes.js';
 import { registerBaselines } from './features/baselines.js';
 import { registerWriterSessions } from './features/writer-sessions.js';
 import { registerCheckpoints } from './features/checkpoints.js';
+import { registerHandoffs } from './features/handoffs.js';
 import { checkProjectCapacity, DEFAULT_RECORDS_LIMIT, ProjectCapacityExceeded } from './storage/project-capacity.js';
 import { requestIdUsedElsewhere } from './storage/request-ids.js';
 
@@ -35,7 +36,7 @@ export async function buildApp(options: AppOptions) {
     const version = (db.prepare('select sqlite_version() as version').get() as {version: string}).version.split('.').map(Number);
     if (version[0] < 3 || (version[0] === 3 && (version[1] < 51 || (version[1] === 51 && version[2] < 3)))) throw new Error('SQLite 3.51.3 or later required');
     const schemaVersion = db.pragma('user_version', { simple: true }) as number;
-    if (schemaVersion > 10) throw new Error('Unsupported database schema');
+    if (schemaVersion > 11) throw new Error('Unsupported database schema');
     db.pragma('journal_mode = WAL'); db.pragma('locking_mode = EXCLUSIVE'); db.pragma('foreign_keys = ON'); db.pragma('synchronous = FULL'); db.pragma('busy_timeout = 5000');
     db.exec('BEGIN EXCLUSIVE; COMMIT');
     if (schemaVersion === 0) db.transaction(() => {
@@ -163,6 +164,18 @@ export async function buildApp(options: AppOptions) {
           PRAGMA user_version = 10`);
       })();
     }
+    if (schemaVersion < 11) {
+      if (schemaVersion === 10) {
+        const backupDir = join(dir, 'backups');
+        await mkdir(backupDir, { recursive: true });
+        await db.backup(join(backupDir, `before-schema-11-${randomUUID()}.db`));
+      }
+      db.transaction(() => {
+        db!.exec(`CREATE TABLE handoff_snapshots (id TEXT PRIMARY KEY, change_id TEXT NOT NULL REFERENCES changes(id), project_id TEXT NOT NULL REFERENCES projects(id), cycle INTEGER NOT NULL, version INTEGER NOT NULL, phase TEXT NOT NULL, content_json TEXT NOT NULL, created_at TEXT NOT NULL);
+          CREATE TABLE handoff_requests (request_id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, snapshot_id TEXT NOT NULL REFERENCES handoff_snapshots(id), committed_at TEXT NOT NULL);
+          PRAGMA user_version = 11`);
+      })();
+    }
     db.transaction(() => {
       db!.exec("UPDATE changes SET version = version + 1 WHERE id IN (SELECT change_id FROM writer_sessions WHERE status = 'active')");
       db!.prepare("UPDATE writer_sessions SET status = 'interrupted', ended_at = ? WHERE status = 'active'").run(new Date().toISOString());
@@ -189,7 +202,7 @@ export async function buildApp(options: AppOptions) {
       const agent = !!bearer && equal(bearer, options.agentToken);
       if (!owner && !agent) return sendError(request, reply, 401, 'UNAUTHORIZED', '请先登录工作台。');
       if (request.method !== 'GET') {
-        const agentRoute = request.method === 'POST' && (route === '/api/v1/changes/:changeId/writer-sessions' || route === '/api/v1/writer-sessions/:sessionId/release' || route === '/api/v1/changes/:changeId/checkpoints' || route === '/api/v1/workspaces/:workspaceId/observations');
+        const agentRoute = request.method === 'POST' && (route === '/api/v1/changes/:changeId/writer-sessions' || route === '/api/v1/writer-sessions/:sessionId/release' || route === '/api/v1/changes/:changeId/checkpoints' || route === '/api/v1/workspaces/:workspaceId/observations' || route === '/api/v1/changes/:changeId/handoffs');
         if (owner ? !requestOrigin || request.headers['x-specmill-request'] !== '1' : !agent || !agentRoute) return sendError(request, reply, 403, 'FORBIDDEN', '没有执行此操作的权限。');
       }
     });
@@ -228,6 +241,7 @@ export async function buildApp(options: AppOptions) {
     registerChanges(app, db, recordsLimit);
     registerBaselines(app, db, recordsLimit);
     registerCheckpoints(app, db, recordsLimit, isOwner, authorizeWriter);
+    registerHandoffs(app, db, recordsLimit);
     app.setErrorHandler((error, request, reply) => {
       if (error instanceof ProjectCapacityExceeded) return reply.code(413).send({ code: error.code, message: error.message, requestId: request.id, dimension: error.dimension, used: error.used, requestedIncrement: error.requestedIncrement, limit: error.limit });
       const errorStatus = typeof error === 'object' && error !== null && 'statusCode' in error ? error.statusCode : undefined;

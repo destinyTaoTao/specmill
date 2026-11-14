@@ -59,10 +59,17 @@ async function main() {
           : group === 'checkpoint' && action === 'list' ? ['--change']
             : group === 'checkpoint' && action === 'save' ? ['--change', '--grant-file', '--version', '--observation', '--request-id', '--file', '--pending-file']
               : group === 'receipt' && action === 'show' ? ['--request-id']
+          : group === 'handoff' && action === 'create' ? ['--change', '--request-id']
+            : group === 'handoff' && action === 'show' ? ['--change', '--snapshot', '--file']
           : group === 'session' && action === 'start' ? ['--change', '--workspace', '--binding-version', '--version', '--tool', '--request-id', '--grant-file']
             : group === 'session' && action === 'release' ? ['--grant-file', '--version', '--request-id'] : null;
   if (!allowed || [...flags.keys()].some(key => !allowedCommon.includes(key) && !allowed.includes(key))) throw new CliError('INVALID_ARGUMENT', '命令或参数无效。', 2);
-  for (const key of allowed.filter(key => key !== '--untracked-file' && key !== '--file' && key !== '--pending-file')) required(key);
+  const optionalFlags = ['--untracked-file', '--file', '--pending-file'];
+  for (const key of allowed.filter(key => !optionalFlags.includes(key) && !(group === 'handoff' && action === 'show' && (key === '--change' || key === '--snapshot')))) required(key);
+  if (group === 'handoff' && action === 'show') {
+    if (Number(flags.has('--change')) + Number(flags.has('--snapshot')) !== 1) throw new CliError('INVALID_ARGUMENT', '请指定 --change 或 --snapshot 其中之一。', 2);
+    if (!flags.has('--snapshot') && flags.has('--file')) throw new CliError('INVALID_ARGUMENT', '--file 只能与 --snapshot 搭配。', 2);
+  }
   if (group === 'checkpoint' && action === 'save') {
     if (Number(stdin) + Number(flags.has('--file')) + Number(flags.has('--pending-file')) !== 1) throw new CliError('INVALID_ARGUMENT', '请指定 --file、--stdin 或 --pending-file 其中之一。', 2);
   } else if (stdin) throw new CliError('INVALID_ARGUMENT', '此命令不支持 --stdin。', 2);
@@ -95,6 +102,7 @@ async function main() {
     return grant as Grant & { sessionId: string; generation: number };
   }
   let result: Record<string, unknown>;
+  let rawMarkdown: string | undefined;
   if (group === 'project' && action === 'list') {
     result = await request('/api/v1/projects');
   } else if (group === 'workspace' && action === 'list') {
@@ -143,6 +151,30 @@ async function main() {
     if (!content || typeof content !== 'object' || Array.isArray(content)) throw new CliError('INVALID_ARGUMENT', '保存点正文必须是 JSON 对象。', 2);
     if ('observationId' in content) throw new CliError('INVALID_ARGUMENT', '正文不能包含 observationId，请通过 --observation 指定。', 2);
     result = await request(`/api/v1/changes/${encodeURIComponent(required('--change'))}/checkpoints`, { requestId: required('--request-id'), expectedVersion: number('--version'), writerSessionId: grant.sessionId, generation: grant.generation, payload: { ...content, observationId: required('--observation') } }, grant.writerToken);
+  } else if (group === 'handoff' && action === 'create') {
+    result = await request(`/api/v1/changes/${encodeURIComponent(required('--change'))}/handoffs`, { requestId: required('--request-id') });
+  } else if (group === 'handoff' && action === 'show') {
+    if (flags.has('--change')) {
+      result = await request(`/api/v1/changes/${encodeURIComponent(flags.get('--change')!)}/handoffs`);
+    } else {
+      const rendered = await request(`/api/v1/handoffs/${encodeURIComponent(flags.get('--snapshot')!)}/render`) as { snapshotId?: string; markdown?: string; sha256?: string };
+      if (typeof rendered.markdown !== 'string' || typeof rendered.snapshotId !== 'string' || typeof rendered.sha256 !== 'string') throw new CliError('INVALID_RESPONSE', '交接材料响应不完整。', 6);
+      if (flags.has('--file')) {
+        const target = resolve(flags.get('--file')!);
+        // 不覆盖未知现有文件：输出失败不影响已保存的快照，可换路径重试。
+        try { await writeFile(target, rendered.markdown, { flag: 'wx', mode: 0o600 }); }
+        catch (error) {
+          if (typeof error === 'object' && error !== null && 'code' in error && error.code === 'EEXIST') throw new CliError('OUTPUT_FILE_EXISTS', '目标文件已存在，不会覆盖；请改用新的输出路径。', 6);
+          throw new CliError('OUTPUT_WRITE_FAILED', '无法写出交接材料文件；快照不受影响，可重试。', 6);
+        }
+        result = { snapshotId: rendered.snapshotId, file: target, sha256: rendered.sha256 };
+      } else if (json) {
+        result = { snapshotId: rendered.snapshotId, sha256: rendered.sha256, markdown: rendered.markdown };
+      } else {
+        result = { snapshotId: rendered.snapshotId, sha256: rendered.sha256, markdown: rendered.markdown };
+        rawMarkdown = rendered.markdown;
+      }
+    }
   } else if (group === 'session' && action === 'start') {
     const changeId = required('--change');
     const requestId = required('--request-id');
@@ -170,7 +202,7 @@ async function main() {
     const grant = await readGrant();
     result = await request(`/api/v1/writer-sessions/${encodeURIComponent(grant.sessionId)}/release`, { requestId: required('--request-id'), expectedVersion: number('--version'), generation: grant.generation }, grant.writerToken);
   } else throw new CliError('INVALID_ARGUMENT', '命令无效。', 2);
-  if ((group === 'session' && action === 'release') || (group === 'workspace' && action === 'observe') || (group === 'checkpoint' && action === 'save')) {
+  if ((group === 'session' && action === 'release') || (group === 'workspace' && action === 'observe') || (group === 'checkpoint' && action === 'save') || (group === 'handoff' && action === 'create')) {
     if (typeof result.requestId !== 'string' || typeof result.resourceId !== 'string' || typeof result.recordVersion !== 'number' || typeof result.committedAt !== 'string') throw new CliError('INVALID_RESPONSE', '服务响应缺少回执；写入结果可能未知，请使用原请求标识重试。', 6);
   }
   if (pendingInputFile && stdin) {
@@ -178,7 +210,8 @@ async function main() {
     catch { /* retained encrypted input is still usable if cleanup fails */ }
   }
   if (pendingInputFile) result = { ...result, retainedInputFile: pendingInputFile };
-  process.stdout.write(`${json ? JSON.stringify(result) : JSON.stringify(result, null, 2)}\n`);
+  if (rawMarkdown !== undefined && !json) process.stdout.write(`${rawMarkdown.endsWith('\n') ? rawMarkdown : `${rawMarkdown}\n`}`);
+  else process.stdout.write(`${json ? JSON.stringify(result) : JSON.stringify(result, null, 2)}\n`);
 }
 
 main().catch((error: unknown) => {
