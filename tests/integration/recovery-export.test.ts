@@ -10,7 +10,6 @@ import { buildApp } from '../../src/server/app.js';
 const dirs: string[] = [];
 const apps: Awaited<ReturnType<typeof buildApp>>[] = [];
 const headers = { host: '127.0.0.1:43222', origin: 'http://127.0.0.1:43222' };
-// 两个并存的测试服务使用不同端口；headers 仅用于 owner 会话注入，端口一致即可。
 const agentHeaders = { host: headers.host, authorization: 'Bearer agent-token' };
 afterEach(async () => {
   for (const app of apps.splice(0)) await app.close();
@@ -76,13 +75,18 @@ function readZipEntries(zip: Buffer): Map<string, Buffer> {
 describe('project recovery export', () => {
   it('exports a consistent zip with manifest, records and verified attachments without credentials', async () => {
     const { app, projectId, ownerHeaders } = await setup();
-    await uploadAttachment(app, projectId, 'export-att-1', Buffer.from('证据日志内容\n第二行\n', 'utf8'));
+    const logContent = Buffer.from('证据日志内容\n第二行\n', 'utf8');
+    await uploadAttachment(app, projectId, 'export-att-1', logContent);
     const usedBefore = (await app.inject({ url: `/api/v1/projects/${projectId}/capacity`, headers: ownerHeaders })).json().records as { used: number };
     const start = await app.inject({ method: 'POST', url: `/api/v1/projects/${projectId}/exports`, headers: agentHeaders, payload: { requestId: 'export-1' } });
     expect(start.statusCode).toBe(201);
+    expect(start.json().status).toBe('preparing');
     const operationId = start.json().resourceId as string;
-    expect(start.json().status).toBe('ready');
-    const sha256 = start.json().sha256 as string;
+    // 首次状态查询触发惰性生成
+    const status = await app.inject({ url: `/api/v1/exports/${operationId}`, headers: ownerHeaders });
+    expect(status.json().status).toBe('ready');
+    const sha256 = status.json().sha256 as string;
+    // 操作状态不占用项目预算
     const usedAfter = (await app.inject({ url: `/api/v1/projects/${projectId}/capacity`, headers: ownerHeaders })).json().records as { used: number };
     expect(usedAfter.used).toBe(usedBefore.used);
     // 幂等重放：同一请求标识返回同一操作
@@ -96,26 +100,22 @@ describe('project recovery export', () => {
     const entries = readZipEntries(zip);
     const manifest = JSON.parse(entries.get('manifest.json')!.toString('utf8')) as { formatVersion: number; schemaVersion: number; projectId: string; files: { path: string; sha256: string; size: number }[] };
     expect(manifest.formatVersion).toBe(1);
-    expect(manifest.schemaVersion).toBe(15);
+    expect(manifest.schemaVersion).toBe(16);
     expect(manifest.projectId).toBe(projectId);
     for (const file of manifest.files) {
       const content = entries.get(file.path)!;
       expect(createHash('sha256').update(content).digest('hex')).toBe(file.sha256);
       expect(content.length).toBe(file.size);
     }
-    expect(manifest.files.some(item => item.path === `attachments/${createHash('sha256').update(Buffer.from('证据日志内容\n第二行\n', 'utf8')).digest('hex')}`)).toBe(true);
-    const records = JSON.parse(entries.get('records.json')!.toString('utf8')) as { project: { id: string; name: string }; changes: { id: string; title?: string }[]; writerSessions: Record<string, unknown>[]; attachments: { id: string }[] };
+    const attachmentSha = createHash('sha256').update(logContent).digest('hex');
+    expect(manifest.files.some(item => item.path === `attachments/${attachmentSha}`)).toBe(true);
+    const records = JSON.parse(entries.get('records.json')!.toString('utf8')) as { project: { id: string; name: string }; writerSessions: Record<string, unknown>[] };
     expect(records.project.id).toBe(projectId);
     expect(JSON.stringify(records)).toContain('恢复变更');
-    // 凭据不进入恢复包：会话授权哈希剥离
     expect(JSON.stringify(records)).not.toContain('claim_hash');
-    expect(entries.has(`attachments/${createHash('sha256').update(Buffer.from('证据日志内容\n第二行\n', 'utf8')).digest('hex')}`)).toBe(true);
+    expect(entries.get(`attachments/${attachmentSha}`)).toEqual(logContent);
     // 下载仅限用户
     expect((await app.inject({ url: `/api/v1/exports/${operationId}/download`, headers: agentHeaders })).statusCode).toBe(403);
-    // 状态查询
-    const status = await app.inject({ url: `/api/v1/exports/${operationId}`, headers: ownerHeaders });
-    expect(status.json()).toEqual(expect.objectContaining({ id: operationId, status: 'ready', projectId }));
-
   }, 30000);
 
   it('fails the export with specific references when attachments are broken and stays consistent across restarts', async () => {
@@ -123,17 +123,17 @@ describe('project recovery export', () => {
     const attachmentId = await uploadAttachment(app, projectId, 'export-att-broken', Buffer.from('待损坏附件\n', 'utf8'));
     const sha256 = createHash('sha256').update(Buffer.from('待损坏附件\n', 'utf8')).digest('hex');
     await writeFile(join(dataDir, 'attachments', projectId, sha256), Buffer.from('损坏内容\n', 'utf8'));
-    const failed = await app.inject({ method: 'POST', url: `/api/v1/projects/${projectId}/exports`, headers: agentHeaders, payload: { requestId: 'export-broken' } });
-    expect(failed.statusCode).toBe(503);
-    expect(failed.json().message).toContain(attachmentId);
-    const status = (await app.inject({ url: `/api/v1/exports/${failed.json().resourceId}`, headers: ownerHeaders })).json() as { status: string; error: string };
+    const start = await app.inject({ method: 'POST', url: `/api/v1/projects/${projectId}/exports`, headers: agentHeaders, payload: { requestId: 'export-broken' } });
+    expect(start.statusCode).toBe(201);
+    const status = (await app.inject({ url: `/api/v1/exports/${start.json().resourceId}`, headers: ownerHeaders })).json() as { status: string; error: string };
     expect(status.status).toBe('failed');
     expect(status.error).toContain(attachmentId);
+    expect((await app.inject({ url: `/api/v1/exports/${start.json().resourceId}/download`, headers: ownerHeaders })).json().code).toBe('EXPORT_NOT_READY');
     // 修复附件后按新请求导出成功
     await writeFile(join(dataDir, 'attachments', projectId, sha256), Buffer.from('待损坏附件\n', 'utf8'));
     const ok = await app.inject({ method: 'POST', url: `/api/v1/projects/${projectId}/exports`, headers: agentHeaders, payload: { requestId: 'export-fixed' } });
     expect(ok.statusCode).toBe(201);
-    expect(ok.json().status).toBe('ready');
+    expect((await app.inject({ url: `/api/v1/exports/${ok.json().resourceId}`, headers: ownerHeaders })).json().status).toBe('ready');
     // 重启：准备中的操作标为失败
     await app.close(); apps.splice(apps.indexOf(app), 1);
     const db = new Database(join(dataDir, 'specmill.db'));
@@ -147,14 +147,28 @@ describe('project recovery export', () => {
     expect(marked.error).toContain('重启');
   }, 30000);
 
-  it('keeps exports project-scoped and does not let operation state consume the project budget', async () => {
+  it('enforces the single-operation limit, supports cancel and keeps exports project-scoped', async () => {
     const first = await setup();
-    await uploadAttachment(first.app, first.projectId, 'scope-att-a', Buffer.from('项目 A 的附件\n', 'utf8'));
-    const exportA = await first.app.inject({ method: 'POST', url: `/api/v1/projects/${first.projectId}/exports`, headers: agentHeaders, payload: { requestId: 'scope-export-a' } });
-    expect(exportA.statusCode).toBe(201);
-    const zipA = (await first.app.inject({ url: `/api/v1/exports/${exportA.json().resourceId}/download`, headers: first.ownerHeaders })).rawPayload!;
-    const entriesA = readZipEntries(zipA);
-    const recordsA = JSON.parse(entriesA.get('records.json')!.toString('utf8')) as { project: { id: string } };
+    // 单操作限制：准备中的导出阻塞第二个导出
+    const startA = await first.app.inject({ method: 'POST', url: `/api/v1/projects/${first.projectId}/exports`, headers: agentHeaders, payload: { requestId: 'scope-export-a' } });
+    expect(startA.statusCode).toBe(201);
+    const blocked = await first.app.inject({ method: 'POST', url: `/api/v1/projects/${first.projectId}/exports`, headers: agentHeaders, payload: { requestId: 'scope-export-b' } });
+    expect(blocked.statusCode).toBe(409);
+    expect(blocked.json().code).toBe('EXPORT_IN_PROGRESS');
+    // 准备阶段可取消（仅用户）；取消后不生成、无下载
+    const agentCancel = await first.app.inject({ method: 'POST', url: `/api/v1/exports/${startA.json().resourceId}/cancel`, headers: agentHeaders, payload: { requestId: 'cancel-agent' } });
+    expect(agentCancel.statusCode).toBe(403);
+    const canceled = await first.app.inject({ method: 'POST', url: `/api/v1/exports/${startA.json().resourceId}/cancel`, headers: first.ownerHeaders, payload: { requestId: 'cancel-1' } });
+    expect(canceled.statusCode).toBe(200);
+    expect(canceled.json().status).toBe('canceled');
+    expect((await first.app.inject({ url: `/api/v1/exports/${startA.json().resourceId}`, headers: first.ownerHeaders })).json().status).toBe('canceled');
+    expect((await first.app.inject({ url: `/api/v1/exports/${startA.json().resourceId}/download`, headers: first.ownerHeaders })).json().code).toBe('EXPORT_NOT_READY');
+    // 取消后可再次发起
+    const startB = await first.app.inject({ method: 'POST', url: `/api/v1/projects/${first.projectId}/exports`, headers: agentHeaders, payload: { requestId: 'scope-export-c' } });
+    expect(startB.statusCode).toBe(201);
+    expect((await first.app.inject({ url: `/api/v1/exports/${startB.json().resourceId}`, headers: first.ownerHeaders })).json().status).toBe('ready');
+    const zipA = (await first.app.inject({ url: `/api/v1/exports/${startB.json().resourceId}/download`, headers: first.ownerHeaders })).rawPayload!;
+    const recordsA = JSON.parse(readZipEntries(zipA).get('records.json')!.toString('utf8')) as { project: { id: string } };
     expect(recordsA.project.id).toBe(first.projectId);
     // 同一应用内新建第二个项目：同请求标识跨项目被拒；新请求正常导出且不含项目 A 的记录
     const projectB = await first.app.inject({ method: 'POST', url: '/api/v1/projects', headers: first.ownerHeaders, payload: { name: '恢复项目B', requestId: 'recovery-project-b' } });

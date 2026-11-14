@@ -100,7 +100,8 @@ function ExportSection({ projectId }: { projectId: string }) {
       const receipt = await readJson<{ resourceId: string; status: string }>(await fetch(`/api/v1/projects/${projectId}/exports`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-SpecMill-Request': '1' }, body: JSON.stringify({ requestId: requestId.current }) }), '导出失败。');
       requestId.current = crypto.randomUUID();
       await reload();
-      setNotice(receipt.status === 'ready' ? '恢复包已生成，可下载。' : '导出未完成，请查看操作状态。');
+      const finished = (await readJson<{ exports: ExportOperation[] }>(await fetch(`/api/v1/projects/${projectId}/exports`), '读取导出记录失败。')).exports.find(item => item.id === receipt.resourceId);
+      setNotice(finished && finished.status === 'ready' ? '恢复包已生成，可下载。' : finished && finished.status === 'failed' ? `导出失败：${finished.error ?? ''}` : '导出进行中，请稍后查看状态。');
     } catch (err) { setError(err instanceof ApiError ? err.message : '导出结果未知，可重试。'); } finally { setBusy(false); }
   }
   return <section><h3>导出恢复包</h3>{error && <p role="alert">{error}</p>}{notice && <p>{notice}</p>}

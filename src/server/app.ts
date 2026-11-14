@@ -39,7 +39,7 @@ export async function buildApp(options: AppOptions) {
     const version = (db.prepare('select sqlite_version() as version').get() as {version: string}).version.split('.').map(Number);
     if (version[0] < 3 || (version[0] === 3 && (version[1] < 51 || (version[1] === 51 && version[2] < 3)))) throw new Error('SQLite 3.51.3 or later required');
     const schemaVersion = db.pragma('user_version', { simple: true }) as number;
-    if (schemaVersion > 15) throw new Error('Unsupported database schema');
+    if (schemaVersion > 16) throw new Error('Unsupported database schema');
     db.pragma('journal_mode = WAL'); db.pragma('locking_mode = EXCLUSIVE'); db.pragma('foreign_keys = ON'); db.pragma('synchronous = FULL'); db.pragma('busy_timeout = 5000');
     db.exec('BEGIN EXCLUSIVE; COMMIT');
     if (schemaVersion === 0) db.transaction(() => {
@@ -233,6 +233,16 @@ export async function buildApp(options: AppOptions) {
       db.transaction(() => {
         db!.exec(`CREATE TABLE export_operations (id TEXT PRIMARY KEY, project_id TEXT NOT NULL REFERENCES projects(id), request_id TEXT NOT NULL UNIQUE, status TEXT NOT NULL, sha256 TEXT, size INTEGER, error TEXT, created_at TEXT NOT NULL, finished_at TEXT);
           PRAGMA user_version = 15`);
+      })();
+    }
+    if (schemaVersion < 16) {
+      if (schemaVersion === 15) {
+        const backupDir = join(dir, 'backups');
+        await mkdir(backupDir, { recursive: true });
+        await db.backup(join(backupDir, `before-schema-16-${randomUUID()}.db`));
+      }
+      db.transaction(() => {
+        db!.exec('ALTER TABLE export_operations ADD COLUMN deadline_at TEXT; PRAGMA user_version = 16');
       })();
     }
     db.transaction(() => {
