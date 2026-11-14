@@ -77,7 +77,7 @@ function DraftCard({ projectId, change, workspaces, refresh }: { projectId: stri
     <button disabled={busy || needsReload} onClick={() => setShowBaseline(value => !value)}>规格 {change.title}</button>
     <WriterSessionPanel change={change} workspaces={workspaces} refresh={refresh} />
     <HandoffPanel change={change} workspaces={workspaces} />
-    <EvidencePanel change={change} refresh={refresh} />
+    <EvidencePanel projectId={projectId} change={change} refresh={refresh} />
     {showBaseline && <BaselinePanel projectId={projectId} change={change} workspaces={workspaces} refresh={refresh} canAdopt={change.phase !== 'Canceled'} />}
   </section>;
 }

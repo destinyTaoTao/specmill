@@ -34,16 +34,18 @@ export function projectRecords(db: Database.Database, projectId: string) {
     acceptanceTargetRequests: db.prepare('SELECT r.* FROM acceptance_target_requests r JOIN acceptance_targets t ON t.id = r.target_id JOIN changes c ON c.id = t.change_id WHERE c.project_id = ? ORDER BY r.request_id').all(projectId),
     acceptanceProposals: db.prepare('SELECT p.* FROM acceptance_proposals p JOIN changes c ON c.id = p.change_id WHERE c.project_id = ? ORDER BY p.id').all(projectId),
     acceptanceProposalRequests: db.prepare('SELECT r.* FROM acceptance_proposal_requests r JOIN acceptance_proposals p ON p.id = r.proposal_id JOIN changes c ON c.id = p.change_id WHERE c.project_id = ? ORDER BY r.request_id').all(projectId),
+    attachments: db.prepare('SELECT a.* FROM attachments a WHERE a.project_id = ? ORDER BY a.id').all(projectId),
+    attachmentRequests: db.prepare('SELECT r.* FROM attachment_requests r JOIN attachments a ON a.id = r.attachment_id WHERE a.project_id = ? ORDER BY r.request_id').all(projectId),
   };
 }
 
 export function projectRecordBytes(db: Database.Database, projectId: string) {
   const records = projectRecords(db, projectId);
   if (records === null) return 0;
-  // Reserve enough for interruption or normal release, including the maximum
-  // request-id encoding and receipt, so a full project can free a workspace.
+  // 每个唯一附件按其内容字节数计一次；预留活跃会话的释放/中断回执开销。
+  const attachmentTotal = (db.prepare('SELECT COALESCE(SUM(size), 0) AS total FROM attachments WHERE project_id = ?').get(projectId) as { total: number }).total;
   const active = (db.prepare("SELECT COUNT(*) AS count FROM writer_sessions s JOIN changes c ON c.id = s.change_id WHERE c.project_id = ? AND s.status = 'active'").get(projectId) as { count: number }).count;
-  return Buffer.byteLength(JSON.stringify(records), 'utf8') + active * 2048;
+  return Buffer.byteLength(JSON.stringify(records), 'utf8') + active * 2048 + attachmentTotal;
 }
 
 export class ProjectCapacityExceeded extends Error {

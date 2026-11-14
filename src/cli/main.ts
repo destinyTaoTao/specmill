@@ -63,17 +63,19 @@ async function main() {
             : group === 'handoff' && action === 'show' ? ['--change', '--snapshot', '--file']
           : group === 'run' && action === 'add' ? ['--change', '--workspace', '--method', '--result', '--exit-status', '--claimed-commit', '--claimed-clean', '--notes', '--request-id']
             : group === 'run' && action === 'list' ? ['--change']
-          : group === 'evidence' && action === 'add' ? ['--change', '--execution', '--criterion-baseline', '--criterion-id', '--criterion-revision', '--criterion-index', '--result', '--actual-commit', '--notes', '--request-id']
+          : group === 'evidence' && action === 'add' ? ['--change', '--execution', '--criterion-baseline', '--criterion-id', '--criterion-revision', '--criterion-index', '--result', '--actual-commit', '--notes', '--attachment', '--request-id']
             : group === 'evidence' && action === 'list' ? ['--change']
           : group === 'target' && action === 'add' ? ['--change', '--commit', '--notes', '--request-id']
             : group === 'target' && action === 'list' ? ['--change']
           : group === 'proposal' && action === 'submit' ? ['--change', '--version', '--target', '--reason', '--evidence', '--request-id']
             : group === 'proposal' && action === 'list' ? ['--change']
+          : group === 'attachment' && action === 'add' ? ['--project', '--file', '--filename', '--content-type', '--request-id']
+            : group === 'attachment' && action === 'list' ? ['--project']
           : group === 'session' && action === 'start' ? ['--change', '--workspace', '--binding-version', '--version', '--tool', '--request-id', '--grant-file']
             : group === 'session' && action === 'release' ? ['--grant-file', '--version', '--request-id'] : null;
   if (!allowed || [...flags.keys()].some(key => !allowedCommon.includes(key) && !allowed.includes(key))) throw new CliError('INVALID_ARGUMENT', '命令或参数无效。', 2);
   const optionalFlags = ['--untracked-file', '--file', '--pending-file'];
-  const optionalFor: Record<string, string[]> = { 'run add': ['--exit-status', '--claimed-commit', '--claimed-clean', '--notes'], 'evidence add': ['--actual-commit', '--notes', '--criterion-baseline', '--criterion-revision'], 'target add': ['--notes'], 'proposal submit': ['--target', '--evidence'] };
+  const optionalFor: Record<string, string[]> = { 'run add': ['--exit-status', '--claimed-commit', '--claimed-clean', '--notes'], 'evidence add': ['--actual-commit', '--notes', '--attachment', '--criterion-baseline', '--criterion-revision'], 'target add': ['--notes'], 'proposal submit': ['--target', '--evidence'], 'attachment add': ['--filename', '--content-type'] };
   const optionalHere = optionalFor[`${group} ${action}`] ?? [];
   for (const key of allowed.filter(key => !optionalFlags.includes(key) && !optionalHere.includes(key) && !(group === 'handoff' && action === 'show' && (key === '--change' || key === '--snapshot')))) required(key);
   if (group === 'handoff' && action === 'show') {
@@ -105,6 +107,20 @@ async function main() {
       throw new CliError(typeof value?.code === 'string' ? value.code : 'SERVICE_ERROR', typeof value?.message === 'string' ? value.message : '本机服务请求失败。', exitCode, details);
     }
     if (!value || typeof value !== 'object' || Array.isArray(value)) throw new CliError('INVALID_RESPONSE', '服务响应不完整；写入结果可能未知，请使用原请求标识重试。', 6);
+    return value;
+  }
+  async function requestRaw(path: string, content: Buffer) {
+    let response: Response;
+    try {
+      response = await fetch(new URL(path, server), { method: 'POST', redirect: 'error', headers: { Authorization: `Bearer ${agentToken}`, 'Content-Type': 'application/octet-stream', 'Content-Length': String(content.length) }, body: new Uint8Array(content), signal: AbortSignal.timeout(60000) });
+    } catch { throw new CliError('SERVICE_UNAVAILABLE', '无法连接本机服务；上传结果可能未知，请使用原请求标识重试。', 6); }
+    const value = await response.json().catch(() => null) as Record<string, unknown> | null;
+    if (!response.ok) {
+      const exitCode = response.status === 401 || response.status === 403 ? 4 : response.status === 409 ? 3 : response.status === 422 ? 5 : response.status === 400 || response.status === 413 ? 2 : 6;
+      const details = Object.fromEntries(['requestId', 'dimension', 'used', 'requestedIncrement', 'limit'].filter(key => value?.[key] !== undefined).map(key => [key, value?.[key]]));
+      throw new CliError(typeof value?.code === 'string' ? value.code : 'SERVICE_ERROR', typeof value?.message === 'string' ? value.message : '本机服务请求失败。', exitCode, details);
+    }
+    if (!value || typeof value !== 'object' || Array.isArray(value)) throw new CliError('INVALID_RESPONSE', '服务响应不完整；上传结果可能未知，请使用原请求标识重试。', 6);
     return value;
   }
   async function readGrant() {
@@ -204,6 +220,7 @@ async function main() {
       criterion: flags.has('--criterion-baseline') ? { kind: 'baseline', baselineId: flags.get('--criterion-baseline')!, criterionId: required('--criterion-id') } : { kind: 'draft', revisionId: flags.get('--criterion-revision')! },
       criterionIndex: number('--criterion-index'), result: required('--result') as 'passed' | 'failed',
       actualCommit: flags.get('--actual-commit'), notes: flags.get('--notes'),
+      attachmentIds: flags.get('--attachment')?.split(',').map(item => item.trim()).filter(Boolean),
     } });
   } else if (group === 'evidence' && action === 'list') {
     result = await request(`/api/v1/changes/${encodeURIComponent(required('--change'))}/evidence`);
@@ -217,6 +234,17 @@ async function main() {
     } });
   } else if (group === 'proposal' && action === 'list') {
     result = await request(`/api/v1/changes/${encodeURIComponent(required('--change'))}/acceptance-proposals`);
+  } else if (group === 'attachment' && action === 'add') {
+    let content: Buffer;
+    try { content = await readFile(resolve(required('--file'))); }
+    catch { throw new CliError('INPUT_ERROR', '无法读取附件文件。', 6); }
+    if (content.length === 0) throw new CliError('INPUT_ERROR', '附件内容为空。', 2);
+    if (content.length > 5 * 1024 * 1024) throw new CliError('INPUT_ERROR', '单个附件不能超过 5 MiB。', 2);
+    const query = new URLSearchParams({ requestId: required('--request-id'), filename: flags.get('--filename') ?? resolve(required('--file')).split(/[\\/]/).pop()! });
+    if (flags.has('--content-type')) query.set('contentType', flags.get('--content-type')!);
+    result = await requestRaw(`/api/v1/projects/${encodeURIComponent(required('--project'))}/attachments?${query.toString()}`, content);
+  } else if (group === 'attachment' && action === 'list') {
+    result = await request(`/api/v1/projects/${encodeURIComponent(required('--project'))}/attachments`);
   } else if (group === 'session' && action === 'start') {
     const changeId = required('--change');
     const requestId = required('--request-id');
@@ -244,7 +272,7 @@ async function main() {
     const grant = await readGrant();
     result = await request(`/api/v1/writer-sessions/${encodeURIComponent(grant.sessionId)}/release`, { requestId: required('--request-id'), expectedVersion: number('--version'), generation: grant.generation }, grant.writerToken);
   } else throw new CliError('INVALID_ARGUMENT', '命令无效。', 2);
-  if ((group === 'session' && action === 'release') || (group === 'workspace' && action === 'observe') || (group === 'checkpoint' && action === 'save') || (group === 'handoff' && action === 'create') || (group === 'run' && action === 'add') || (group === 'evidence' && action === 'add') || (group === 'target' && action === 'add') || (group === 'proposal' && action === 'submit')) {
+  if ((group === 'session' && action === 'release') || (group === 'workspace' && action === 'observe') || (group === 'checkpoint' && action === 'save') || (group === 'handoff' && action === 'create') || (group === 'run' && action === 'add') || (group === 'evidence' && action === 'add') || (group === 'target' && action === 'add') || (group === 'proposal' && action === 'submit') || (group === 'attachment' && action === 'add')) {
     if (typeof result.requestId !== 'string' || typeof result.resourceId !== 'string' || typeof result.recordVersion !== 'number' || typeof result.committedAt !== 'string') throw new CliError('INVALID_RESPONSE', '服务响应缺少回执；写入结果可能未知，请使用原请求标识重试。', 6);
   }
   if (pendingInputFile && stdin) {

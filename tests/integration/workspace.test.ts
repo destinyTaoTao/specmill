@@ -218,18 +218,18 @@ describe('workspace binding', () => {
   });
 
   it('rejects a binding over the project capacity without saving a partial binding or receipt', async () => {
-    const { app, repoDir, ownerHeaders, projectId } = await setup(800);
+    const { app, repoDir, ownerHeaders, projectId } = await setup(1000);
     const url = `/api/v1/projects/${projectId}/workspaces`;
     const payload = { requestId: 'over-budget', expectedVersion: null, payload: { workspaceId: null, path: repoDir } };
     const rejected = await app.inject({ method: 'POST', url, headers: ownerHeaders, payload });
     expect(rejected.statusCode).toBe(413);
-    expect(rejected.json()).toEqual(expect.objectContaining({ code: 'PROJECT_CAPACITY_EXCEEDED', dimension: 'records', limit: 800, used: expect.any(Number), requestedIncrement: expect.any(Number) }));
+    expect(rejected.json()).toEqual(expect.objectContaining({ code: 'PROJECT_CAPACITY_EXCEEDED', dimension: 'records', limit: 1000, used: expect.any(Number), requestedIncrement: expect.any(Number) }));
     const retry = await app.inject({ method: 'POST', url, headers: ownerHeaders, payload });
     expect(retry.statusCode).toBe(413);
     expect((await app.inject({ url, headers: ownerHeaders })).json().workspaces).toEqual([]);
     const capacity = await app.inject({ url: `/api/v1/projects/${projectId}/capacity`, headers: ownerHeaders });
     expect(capacity.statusCode).toBe(200);
-    expect(capacity.json()).toEqual(expect.objectContaining({ records: expect.objectContaining({ limit: 800, used: expect.any(Number) }) }));
+    expect(capacity.json()).toEqual(expect.objectContaining({ records: expect.objectContaining({ limit: 1000, used: expect.any(Number) }) }));
   });
 
   it('records an observation of an unborn repository and a selected untracked file', async () => {
