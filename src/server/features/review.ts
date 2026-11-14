@@ -3,6 +3,7 @@ import type Database from 'better-sqlite3';
 import { randomUUID } from 'node:crypto';
 import { checkProjectCapacity, projectRecordBytes } from '../storage/project-capacity.js';
 import { checkAttachmentHealth } from '../storage/attachments.js';
+import { createHandoffSnapshotRow } from './handoffs.js';
 import { requestIdUsedElsewhere } from '../storage/request-ids.js';
 
 type Receipt = { requestId: string; resourceId: string; recordVersion: number; committedAt: string };
@@ -188,7 +189,9 @@ export function registerReview(app: FastifyInstance, db: Database.Database, reco
           if (blockingFailures(change.id, change.cycle, context.baselineId, criterion.id).length > 0) return 'GATE_INCOMPLETE';
         }
         db.prepare("UPDATE writer_sessions SET status = 'completed', ended_at = ? WHERE change_id = ? AND status = 'active'").run(committedAt, change.id);
-        db.prepare("INSERT INTO change_transitions(id,change_id,from_phase,to_phase,cycle,record_version,reason,created_at) VALUES (?,?,?,?,?,?,?,?)").run(randomUUID(), change.id, change.phase, 'Accepted', change.cycle, recordVersion, '用户完成冻结版本验收', committedAt);
+        // 最终固定快照：验收完成时在同一事务捕获全部记录，失败回滚不留快照。
+        const snapshot = createHandoffSnapshotRow(db, change.id);
+        db.prepare("INSERT INTO change_transitions(id,change_id,from_phase,to_phase,cycle,record_version,reason,created_at) VALUES (?,?,?,?,?,?,?,?)").run(randomUUID(), change.id, change.phase, 'Accepted', change.cycle, recordVersion, snapshot ? `用户完成冻结版本验收；完成快照 ${snapshot.snapshotId}` : '用户完成冻结版本验收', committedAt);
         db.prepare('UPDATE changes SET phase = ?, version = ? WHERE id = ?').run('Accepted', recordVersion, change.id);
         accepted = true;
       } else {

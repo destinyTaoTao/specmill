@@ -8,6 +8,46 @@ import { renderHandoffMarkdown, type HandoffContent } from '../../shared/handoff
 
 type Receipt = { requestId: string; resourceId: string; recordVersion: number; committedAt: string };
 
+// 捕获当前状态并写入固定交接快照（不含请求登记与容量校验，由调用方在同一事务内完成）。
+export function createHandoffSnapshotRow(db: Database.Database, changeId: string): { snapshotId: string; committedAt: string } | null {
+  const change = db.prepare('SELECT c.project_id AS projectId, c.phase, c.cycle, c.version, c.current_revision_id AS revisionId, c.current_baseline_id AS baselineId, p.name AS projectName FROM changes c JOIN projects p ON p.id = c.project_id WHERE c.id = ?').get(changeId) as { projectId: string; phase: string; cycle: number; version: number; revisionId: string; baselineId: string | null; projectName: string } | undefined;
+  if (!change) return null;
+  const revision = db.prepare('SELECT title, goal, scope, non_goals AS nonGoals, criteria_json AS criteriaJson FROM change_revisions WHERE id = ? AND change_id = ?').get(change.revisionId, changeId) as { title: string; goal: string; scope: string; nonGoals: string; criteriaJson: string } | undefined;
+  if (!revision) return null;
+  let goal = revision.goal;
+  let scope = revision.scope;
+  let nonGoals = revision.nonGoals;
+  let criteria: string[] = JSON.parse(revision.criteriaJson);
+  let basis: HandoffContent['basis'] = { kind: 'unconfirmedDraft', revisionId: change.revisionId };
+  if (change.baselineId) {
+    const baseline = db.prepare('SELECT id, draft_revision_id AS draftRevisionId, goal, scope, non_goals AS nonGoals, criteria_json AS criteriaJson, source_path AS sourcePath, source_sha256 AS sourceSha256, source_head AS sourceHead FROM baselines WHERE id = ? AND change_id = ?').get(change.baselineId, changeId) as { id: string; draftRevisionId: string; goal: string; scope: string; nonGoals: string; criteriaJson: string; sourcePath: string; sourceSha256: string; sourceHead: string | null } | undefined;
+    if (!baseline) return null;
+    goal = baseline.goal;
+    scope = baseline.scope;
+    nonGoals = baseline.nonGoals;
+    criteria = JSON.parse(baseline.criteriaJson);
+    basis = { kind: 'baseline', baselineId: baseline.id, revisionId: baseline.draftRevisionId, sourcePath: baseline.sourcePath, sourceSha256: baseline.sourceSha256, sourceHead: baseline.sourceHead };
+  }
+  const checkpointRow = db.prepare('SELECT p.id, p.record_version AS recordVersion, p.actor, p.goal, p.done, p.failures, p.unverified, p.blockers, p.next_steps AS nextSteps, p.created_at AS createdAt, o.id AS observationId, o.workspace_id AS observationWorkspaceId, o.binding_version AS bindingVersion, o.path AS observationPath, o.created_at AS observationCreatedAt, o.data_json AS observationJson FROM checkpoints p JOIN workspace_observations o ON o.id = p.observation_id WHERE p.change_id = ? ORDER BY p.record_version DESC LIMIT 1').get(changeId) as { id: string; recordVersion: number; actor: string; goal: string; done: string; failures: string; unverified: string; nextSteps: string; blockers: string; createdAt: string; observationId: string; observationWorkspaceId: string; bindingVersion: number; observationPath: string; observationCreatedAt: string; observationJson: string } | undefined;
+  const checkpoint = checkpointRow ? (() => {
+    const observation = JSON.parse(checkpointRow.observationJson) as { head: string | null; branch: string | null; stable: boolean; limitations: string[]; files: { path: string; status: string; sha256?: string }[]; trackedDiffSha256: string | null };
+    return {
+      id: checkpointRow.id, recordVersion: checkpointRow.recordVersion, actor: checkpointRow.actor as 'user' | 'agent', createdAt: checkpointRow.createdAt,
+      goal: checkpointRow.goal, done: checkpointRow.done, failures: checkpointRow.failures, unverified: checkpointRow.unverified, blockers: checkpointRow.blockers, nextSteps: checkpointRow.nextSteps,
+      observation: { id: checkpointRow.observationId, workspaceId: checkpointRow.observationWorkspaceId, path: checkpointRow.observationPath, bindingVersion: checkpointRow.bindingVersion, createdAt: checkpointRow.observationCreatedAt, ...observation },
+    };
+  })() : null;
+  const snapshotId = randomUUID();
+  const committedAt = new Date().toISOString();
+  const content: HandoffContent = {
+    projectId: change.projectId, projectName: change.projectName, changeId, changeTitle: revision.title,
+    snapshotId, createdAt: committedAt, phase: change.phase, cycle: change.cycle, capturedVersion: change.version,
+    goal, scope, nonGoals, criteria, basis, checkpoint,
+  };
+  db.prepare('INSERT INTO handoff_snapshots(id,change_id,project_id,cycle,version,phase,content_json,created_at) VALUES (?,?,?,?,?,?,?,?)').run(snapshotId, changeId, change.projectId, change.cycle, change.version, change.phase, JSON.stringify(content), committedAt);
+  return { snapshotId, committedAt };
+}
+
 export function registerHandoffs(app: FastifyInstance, db: Database.Database, recordsLimit: number) {
   app.get<{ Params: { changeId: string } }>('/api/v1/changes/:changeId/handoffs', async (request, reply) => {
     if (!db.prepare('SELECT 1 FROM changes WHERE id = ?').get(request.params.changeId)) return reply.code(404).send({ code: 'NOT_FOUND', message: '变更不存在。', requestId: request.id });
@@ -49,45 +89,14 @@ export function registerHandoffs(app: FastifyInstance, db: Database.Database, re
         return { requestId, resourceId: concurrent.snapshotId, recordVersion: 1, committedAt: concurrent.committedAt };
       }
       if (requestIdUsedElsewhere(db, requestId, 'handoffs')) return 'REQUEST_ID_CONFLICT';
-      const change = db.prepare('SELECT c.project_id AS projectId, c.phase, c.cycle, c.version, c.current_revision_id AS revisionId, c.current_baseline_id AS baselineId, p.name AS projectName FROM changes c JOIN projects p ON p.id = c.project_id WHERE c.id = ?').get(changeId) as { projectId: string; phase: string; cycle: number; version: number; revisionId: string; baselineId: string | null; projectName: string } | undefined;
-      if (!change) return 'NOT_FOUND';
-      const revision = db.prepare('SELECT title, goal, scope, non_goals AS nonGoals, criteria_json AS criteriaJson FROM change_revisions WHERE id = ? AND change_id = ?').get(change.revisionId, changeId) as { title: string; goal: string; scope: string; nonGoals: string; criteriaJson: string } | undefined;
-      if (!revision) return 'NOT_FOUND';
-      let goal = revision.goal;
-      let scope = revision.scope;
-      let nonGoals = revision.nonGoals;
-      let criteria: string[] = JSON.parse(revision.criteriaJson);
-      let basis: HandoffContent['basis'] = { kind: 'unconfirmedDraft', revisionId: change.revisionId };
-      if (change.baselineId) {
-        const baseline = db.prepare('SELECT id, draft_revision_id AS draftRevisionId, goal, scope, non_goals AS nonGoals, criteria_json AS criteriaJson, source_path AS sourcePath, source_sha256 AS sourceSha256, source_head AS sourceHead FROM baselines WHERE id = ? AND change_id = ?').get(change.baselineId, changeId) as { id: string; draftRevisionId: string; goal: string; scope: string; nonGoals: string; criteriaJson: string; sourcePath: string; sourceSha256: string; sourceHead: string | null } | undefined;
-        if (!baseline) return 'NOT_FOUND';
-        goal = baseline.goal;
-        scope = baseline.scope;
-        nonGoals = baseline.nonGoals;
-        criteria = JSON.parse(baseline.criteriaJson);
-        basis = { kind: 'baseline', baselineId: baseline.id, revisionId: baseline.draftRevisionId, sourcePath: baseline.sourcePath, sourceSha256: baseline.sourceSha256, sourceHead: baseline.sourceHead };
-      }
-      const checkpointRow = db.prepare('SELECT p.id, p.record_version AS recordVersion, p.actor, p.goal, p.done, p.failures, p.unverified, p.blockers, p.next_steps AS nextSteps, p.created_at AS createdAt, o.id AS observationId, o.workspace_id AS observationWorkspaceId, o.binding_version AS bindingVersion, o.path AS observationPath, o.created_at AS observationCreatedAt, o.data_json AS observationJson FROM checkpoints p JOIN workspace_observations o ON o.id = p.observation_id WHERE p.change_id = ? ORDER BY p.record_version DESC LIMIT 1').get(changeId) as { id: string; recordVersion: number; actor: string; goal: string; done: string; failures: string; unverified: string; nextSteps: string; blockers: string; createdAt: string; observationId: string; observationWorkspaceId: string; bindingVersion: number; observationPath: string; observationCreatedAt: string; observationJson: string } | undefined;
-      const checkpoint = checkpointRow ? (() => {
-        const observation = JSON.parse(checkpointRow.observationJson) as { head: string | null; branch: string | null; stable: boolean; limitations: string[]; files: { path: string; status: string; sha256?: string }[]; trackedDiffSha256: string | null };
-        return {
-          id: checkpointRow.id, recordVersion: checkpointRow.recordVersion, actor: checkpointRow.actor as 'user' | 'agent', createdAt: checkpointRow.createdAt,
-          goal: checkpointRow.goal, done: checkpointRow.done, failures: checkpointRow.failures, unverified: checkpointRow.unverified, blockers: checkpointRow.blockers, nextSteps: checkpointRow.nextSteps,
-          observation: { id: checkpointRow.observationId, workspaceId: checkpointRow.observationWorkspaceId, path: checkpointRow.observationPath, bindingVersion: checkpointRow.bindingVersion, createdAt: checkpointRow.observationCreatedAt, ...observation },
-        };
-      })() : null;
-      const snapshotId = randomUUID();
+      if (!db.prepare('SELECT 1 FROM changes WHERE id = ?').get(changeId)) return 'NOT_FOUND';
+      const before = projectRecordBytes(db, (db.prepare('SELECT project_id FROM changes WHERE id = ?').get(changeId) as { project_id: string }).project_id);
       const committedAt = new Date().toISOString();
-      const content: HandoffContent = {
-        projectId: change.projectId, projectName: change.projectName, changeId, changeTitle: revision.title,
-        snapshotId, createdAt: committedAt, phase: change.phase, cycle: change.cycle, capturedVersion: change.version,
-        goal, scope, nonGoals, criteria, basis, checkpoint,
-      };
-      const before = projectRecordBytes(db, change.projectId);
-      db.prepare('INSERT INTO handoff_snapshots(id,change_id,project_id,cycle,version,phase,content_json,created_at) VALUES (?,?,?,?,?,?,?,?)').run(snapshotId, changeId, change.projectId, change.cycle, change.version, change.phase, JSON.stringify(content), committedAt);
-      db.prepare('INSERT INTO handoff_requests(request_id,fingerprint,snapshot_id,committed_at) VALUES (?,?,?,?)').run(requestId, fingerprint, snapshotId, committedAt);
-      checkProjectCapacity(db, change.projectId, before, recordsLimit);
-      return { requestId, resourceId: snapshotId, recordVersion: 1, committedAt };
+      const created = createHandoffSnapshotRow(db, changeId);
+      if (!created) return 'NOT_FOUND';
+      db.prepare('INSERT INTO handoff_requests(request_id,fingerprint,snapshot_id,committed_at) VALUES (?,?,?,?)').run(requestId, fingerprint, created.snapshotId, committedAt);
+      checkProjectCapacity(db, (db.prepare('SELECT project_id FROM changes WHERE id = ?').get(changeId) as { project_id: string }).project_id, before, recordsLimit);
+      return { requestId, resourceId: created.snapshotId, recordVersion: 1, committedAt };
     })();
     if (typeof result === 'string') return reply.code(result === 'NOT_FOUND' ? 404 : 409).send({ code: result, message: result === 'NOT_FOUND' ? '变更不存在。' : '请求标识已用于不同的内容。', requestId: request.id });
     return reply.code(201).send(result);
