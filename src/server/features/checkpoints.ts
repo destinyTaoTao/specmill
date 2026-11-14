@@ -60,7 +60,7 @@ export function registerCheckpoints(app: FastifyInstance, db: Database.Database,
       const change = db.prepare('SELECT c.project_id AS projectId, c.phase, c.cycle, c.version, c.current_revision_id AS revisionId, c.current_baseline_id AS baselineId, r.goal, b.goal AS baselineGoal, b.draft_revision_id AS baselineRevisionId FROM changes c JOIN change_revisions r ON r.id = c.current_revision_id LEFT JOIN baselines b ON b.id = c.current_baseline_id WHERE c.id = ?').get(changeId) as { projectId: string; phase: string; cycle: number; version: number; revisionId: string; baselineId: string | null; goal: string; baselineGoal: string | null; baselineRevisionId: string | null } | undefined;
       if (!change) return 'NOT_FOUND';
       if (change.version !== expectedVersion) return { currentVersion: change.version };
-      if (change.phase !== 'Draft' && change.phase !== 'Working') return 'SESSION_EXPIRED';
+      if (change.phase !== 'Draft' && change.phase !== 'Working') return 'CHANGE_NOT_WRITABLE';
       const workspace = db.prepare('SELECT w.version, w.common_key AS commonKey, p.common_key AS projectCommonKey FROM workspaces w JOIN project_repositories p ON p.project_id = w.project_id WHERE w.id = ? AND w.project_id = ?').get(session.workspaceId, change.projectId) as { version: number; commonKey: string; projectCommonKey: string } | undefined;
       if (!workspace || workspace.version !== session.bindingVersion || workspace.commonKey !== workspace.projectCommonKey) return 'WORKSPACE_CHANGED';
       const observation = db.prepare('SELECT 1 FROM workspace_observations WHERE id = ? AND workspace_id = ? AND binding_version = ?').get(payload.observationId, session.workspaceId, session.bindingVersion);
@@ -73,7 +73,7 @@ export function registerCheckpoints(app: FastifyInstance, db: Database.Database,
       checkProjectCapacity(db, change.projectId, before, recordsLimit);
       return result;
     })();
-    if (typeof result === 'string') return error(request, reply, result === 'NOT_FOUND' ? 404 : result === 'FORBIDDEN' ? 403 : 409, result, result === 'SESSION_EXPIRED' ? '写会话已失效，请重新开始。' : result === 'FORBIDDEN' ? '没有此写会话的写入授权。' : result === 'OBSERVATION_MISMATCH' ? '工作区观察不属于当前会话的绑定。' : result === 'WORKSPACE_CHANGED' ? '工作区绑定已变化，请重新核对。' : result === 'NOT_FOUND' ? '变更不存在。' : '请求标识已用于不同的内容。');
+    if (typeof result === 'string') return error(request, reply, result === 'NOT_FOUND' ? 404 : result === 'FORBIDDEN' ? 403 : 409, result, result === 'SESSION_EXPIRED' ? '写会话已失效，请重新开始。' : result === 'CHANGE_NOT_WRITABLE' ? '变更正在审阅或已完成验收，当前不能保存进度。' : result === 'FORBIDDEN' ? '没有此写会话的写入授权。' : result === 'OBSERVATION_MISMATCH' ? '工作区观察不属于当前会话的绑定。' : result === 'WORKSPACE_CHANGED' ? '工作区绑定已变化，请重新核对。' : result === 'NOT_FOUND' ? '变更不存在。' : '请求标识已用于不同的内容。');
     if ('currentVersion' in result) return error(request, reply, 409, 'VERSION_CONFLICT', '变更已更新，请刷新后重试。', result.currentVersion);
     return reply.code(201).send(result);
   });

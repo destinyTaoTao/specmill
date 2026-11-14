@@ -61,11 +61,21 @@ async function main() {
               : group === 'receipt' && action === 'show' ? ['--request-id']
           : group === 'handoff' && action === 'create' ? ['--change', '--request-id']
             : group === 'handoff' && action === 'show' ? ['--change', '--snapshot', '--file']
+          : group === 'run' && action === 'add' ? ['--change', '--workspace', '--method', '--result', '--exit-status', '--claimed-commit', '--claimed-clean', '--notes', '--request-id']
+            : group === 'run' && action === 'list' ? ['--change']
+          : group === 'evidence' && action === 'add' ? ['--change', '--execution', '--criterion-baseline', '--criterion-id', '--criterion-revision', '--criterion-index', '--result', '--actual-commit', '--notes', '--request-id']
+            : group === 'evidence' && action === 'list' ? ['--change']
+          : group === 'target' && action === 'add' ? ['--change', '--commit', '--notes', '--request-id']
+            : group === 'target' && action === 'list' ? ['--change']
+          : group === 'proposal' && action === 'submit' ? ['--change', '--version', '--target', '--reason', '--evidence', '--request-id']
+            : group === 'proposal' && action === 'list' ? ['--change']
           : group === 'session' && action === 'start' ? ['--change', '--workspace', '--binding-version', '--version', '--tool', '--request-id', '--grant-file']
             : group === 'session' && action === 'release' ? ['--grant-file', '--version', '--request-id'] : null;
   if (!allowed || [...flags.keys()].some(key => !allowedCommon.includes(key) && !allowed.includes(key))) throw new CliError('INVALID_ARGUMENT', '命令或参数无效。', 2);
   const optionalFlags = ['--untracked-file', '--file', '--pending-file'];
-  for (const key of allowed.filter(key => !optionalFlags.includes(key) && !(group === 'handoff' && action === 'show' && (key === '--change' || key === '--snapshot')))) required(key);
+  const optionalFor: Record<string, string[]> = { 'run add': ['--exit-status', '--claimed-commit', '--claimed-clean', '--notes'], 'evidence add': ['--actual-commit', '--notes', '--criterion-baseline', '--criterion-revision'], 'target add': ['--notes'], 'proposal submit': ['--target', '--evidence'] };
+  const optionalHere = optionalFor[`${group} ${action}`] ?? [];
+  for (const key of allowed.filter(key => !optionalFlags.includes(key) && !optionalHere.includes(key) && !(group === 'handoff' && action === 'show' && (key === '--change' || key === '--snapshot')))) required(key);
   if (group === 'handoff' && action === 'show') {
     if (Number(flags.has('--change')) + Number(flags.has('--snapshot')) !== 1) throw new CliError('INVALID_ARGUMENT', '请指定 --change 或 --snapshot 其中之一。', 2);
     if (!flags.has('--snapshot') && flags.has('--file')) throw new CliError('INVALID_ARGUMENT', '--file 只能与 --snapshot 搭配。', 2);
@@ -75,6 +85,9 @@ async function main() {
   } else if (stdin) throw new CliError('INVALID_ARGUMENT', '此命令不支持 --stdin。', 2);
   if (flags.has('--version')) number('--version');
   if (flags.has('--binding-version')) number('--binding-version');
+  if (flags.has('--criterion-index')) number('--criterion-index');
+  if (flags.has('--result') && !['passed', 'failed', 'unknown'].includes(flags.get('--result')!)) throw new CliError('INVALID_ARGUMENT', '--result 只能是 passed、failed 或 unknown。', 2);
+  if (flags.has('--claimed-clean') && !['true', 'false'].includes(flags.get('--claimed-clean')!)) throw new CliError('INVALID_ARGUMENT', '--claimed-clean 只能是 true 或 false。', 2);
   const dataDir = resolve(flags.get('--data-dir') ?? join(process.env.LOCALAPPDATA ?? join(homedir(), '.local', 'share'), 'SpecMill'));
   let agentToken: string;
   try { agentToken = await decodeSecret((await readFile(join(dataDir, 'cli-token'), 'utf8')).trim()); }
@@ -162,7 +175,7 @@ async function main() {
       if (flags.has('--file')) {
         const target = resolve(flags.get('--file')!);
         // 不覆盖未知现有文件：输出失败不影响已保存的快照，可换路径重试。
-        try { await writeFile(target, rendered.markdown, { flag: 'wx', mode: 0o600 }); }
+        try { await writeFile(target, rendered.markdown, { flag: 'wx' }); }
         catch (error) {
           if (typeof error === 'object' && error !== null && 'code' in error && error.code === 'EEXIST') throw new CliError('OUTPUT_FILE_EXISTS', '目标文件已存在，不会覆盖；请改用新的输出路径。', 6);
           throw new CliError('OUTPUT_WRITE_FAILED', '无法写出交接材料文件；快照不受影响，可重试。', 6);
@@ -175,6 +188,35 @@ async function main() {
         rawMarkdown = rendered.markdown;
       }
     }
+  } else if (group === 'run' && action === 'add') {
+    result = await request(`/api/v1/changes/${encodeURIComponent(required('--change'))}/executions`, { requestId: required('--request-id'), workspaceId: required('--workspace'), payload: {
+      method: required('--method'), result: required('--result') as 'passed' | 'failed' | 'unknown',
+      exitStatus: flags.get('--exit-status'), claimedCommit: flags.get('--claimed-commit'),
+      claimedClean: flags.has('--claimed-clean') ? flags.get('--claimed-clean') === 'true' : undefined, notes: flags.get('--notes'),
+    } });
+  } else if (group === 'run' && action === 'list') {
+    result = await request(`/api/v1/changes/${encodeURIComponent(required('--change'))}/executions`);
+  } else if (group === 'evidence' && action === 'add') {
+    if (Number(flags.has('--criterion-baseline')) + Number(flags.has('--criterion-revision')) !== 1) throw new CliError('INVALID_ARGUMENT', '请指定 --criterion-baseline 或 --criterion-revision 其中之一。', 2);
+    if (flags.has('--criterion-baseline') && !flags.has('--criterion-id')) throw new CliError('INVALID_ARGUMENT', '基线条件需要 --criterion-id 指向稳定条件标识。', 2);
+    result = await request(`/api/v1/changes/${encodeURIComponent(required('--change'))}/evidence`, { requestId: required('--request-id'), payload: {
+      executionId: required('--execution'),
+      criterion: flags.has('--criterion-baseline') ? { kind: 'baseline', baselineId: flags.get('--criterion-baseline')!, criterionId: required('--criterion-id') } : { kind: 'draft', revisionId: flags.get('--criterion-revision')! },
+      criterionIndex: number('--criterion-index'), result: required('--result') as 'passed' | 'failed',
+      actualCommit: flags.get('--actual-commit'), notes: flags.get('--notes'),
+    } });
+  } else if (group === 'evidence' && action === 'list') {
+    result = await request(`/api/v1/changes/${encodeURIComponent(required('--change'))}/evidence`);
+  } else if (group === 'target' && action === 'add') {
+    result = await request(`/api/v1/changes/${encodeURIComponent(required('--change'))}/acceptance-targets`, { requestId: required('--request-id'), payload: { commit: required('--commit'), notes: flags.get('--notes') } });
+  } else if (group === 'target' && action === 'list') {
+    result = await request(`/api/v1/changes/${encodeURIComponent(required('--change'))}/acceptance-targets`);
+  } else if (group === 'proposal' && action === 'submit') {
+    result = await request(`/api/v1/changes/${encodeURIComponent(required('--change'))}/acceptance-proposals`, { requestId: required('--request-id'), expectedVersion: number('--version'), payload: {
+      reason: required('--reason'), targetId: flags.get('--target'), evidenceIds: flags.get('--evidence')?.split(',').map(item => item.trim()).filter(Boolean),
+    } });
+  } else if (group === 'proposal' && action === 'list') {
+    result = await request(`/api/v1/changes/${encodeURIComponent(required('--change'))}/acceptance-proposals`);
   } else if (group === 'session' && action === 'start') {
     const changeId = required('--change');
     const requestId = required('--request-id');
@@ -202,7 +244,7 @@ async function main() {
     const grant = await readGrant();
     result = await request(`/api/v1/writer-sessions/${encodeURIComponent(grant.sessionId)}/release`, { requestId: required('--request-id'), expectedVersion: number('--version'), generation: grant.generation }, grant.writerToken);
   } else throw new CliError('INVALID_ARGUMENT', '命令无效。', 2);
-  if ((group === 'session' && action === 'release') || (group === 'workspace' && action === 'observe') || (group === 'checkpoint' && action === 'save') || (group === 'handoff' && action === 'create')) {
+  if ((group === 'session' && action === 'release') || (group === 'workspace' && action === 'observe') || (group === 'checkpoint' && action === 'save') || (group === 'handoff' && action === 'create') || (group === 'run' && action === 'add') || (group === 'evidence' && action === 'add') || (group === 'target' && action === 'add') || (group === 'proposal' && action === 'submit')) {
     if (typeof result.requestId !== 'string' || typeof result.resourceId !== 'string' || typeof result.recordVersion !== 'number' || typeof result.committedAt !== 'string') throw new CliError('INVALID_RESPONSE', '服务响应缺少回执；写入结果可能未知，请使用原请求标识重试。', 6);
   }
   if (pendingInputFile && stdin) {

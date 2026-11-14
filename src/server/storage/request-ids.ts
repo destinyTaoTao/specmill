@@ -10,8 +10,8 @@ export function sameFingerprint(stored: string, requested: unknown) {
   return canonical(JSON.parse(stored)) === canonical(requested);
 }
 
-type RequestStore = 'projects' | 'workspaces' | 'observations' | 'changes' | 'baselines' | 'writerSessions' | 'checkpoints' | 'handoffs';
-const tables: Record<RequestStore, string> = { projects: 'requests', workspaces: 'workspace_requests', observations: 'observation_requests', changes: 'change_requests', baselines: 'baseline_requests', writerSessions: 'writer_session_requests', checkpoints: 'checkpoint_requests', handoffs: 'handoff_requests' };
+type RequestStore = 'projects' | 'workspaces' | 'observations' | 'changes' | 'baselines' | 'writerSessions' | 'checkpoints' | 'handoffs' | 'executions' | 'evidence' | 'targets' | 'proposals';
+const tables: Record<RequestStore, string> = { projects: 'requests', workspaces: 'workspace_requests', observations: 'observation_requests', changes: 'change_requests', baselines: 'baseline_requests', writerSessions: 'writer_session_requests', checkpoints: 'checkpoint_requests', handoffs: 'handoff_requests', executions: 'execution_requests', evidence: 'evidence_requests', targets: 'acceptance_target_requests', proposals: 'acceptance_proposal_requests' };
 
 export function requestIdUsedElsewhere(db: Database.Database, requestId: string, ownStore: RequestStore) {
   const selected = Object.entries(tables).filter(([name]) => name !== ownStore).map(([, table]) => `SELECT 1 FROM ${table} WHERE request_id = ?`);

@@ -26,6 +26,14 @@ export function projectRecords(db: Database.Database, projectId: string) {
     checkpointRequests: db.prepare('SELECT r.* FROM checkpoint_requests r JOIN checkpoints p ON p.id = r.checkpoint_id JOIN changes c ON c.id = p.change_id WHERE c.project_id = ? ORDER BY r.request_id').all(projectId),
     handoffSnapshots: db.prepare('SELECT s.* FROM handoff_snapshots s JOIN changes c ON c.id = s.change_id WHERE c.project_id = ? ORDER BY s.id').all(projectId),
     handoffRequests: db.prepare('SELECT r.* FROM handoff_requests r JOIN handoff_snapshots s ON s.id = r.snapshot_id JOIN changes c ON c.id = s.change_id WHERE c.project_id = ? ORDER BY r.request_id').all(projectId),
+    executions: db.prepare('SELECT e.* FROM executions e JOIN changes c ON c.id = e.change_id WHERE c.project_id = ? ORDER BY e.id').all(projectId),
+    executionRequests: db.prepare('SELECT r.* FROM execution_requests r JOIN executions e ON e.id = r.execution_id JOIN changes c ON c.id = e.change_id WHERE c.project_id = ? ORDER BY r.request_id').all(projectId),
+    evidenceRecords: db.prepare('SELECT v.* FROM evidence_records v JOIN changes c ON c.id = v.change_id WHERE c.project_id = ? ORDER BY v.id').all(projectId),
+    evidenceRequests: db.prepare('SELECT r.* FROM evidence_requests r JOIN evidence_records v ON v.id = r.evidence_id JOIN changes c ON c.id = v.change_id WHERE c.project_id = ? ORDER BY r.request_id').all(projectId),
+    acceptanceTargets: db.prepare('SELECT t.* FROM acceptance_targets t JOIN changes c ON c.id = t.change_id WHERE c.project_id = ? ORDER BY t.id').all(projectId),
+    acceptanceTargetRequests: db.prepare('SELECT r.* FROM acceptance_target_requests r JOIN acceptance_targets t ON t.id = r.target_id JOIN changes c ON c.id = t.change_id WHERE c.project_id = ? ORDER BY r.request_id').all(projectId),
+    acceptanceProposals: db.prepare('SELECT p.* FROM acceptance_proposals p JOIN changes c ON c.id = p.change_id WHERE c.project_id = ? ORDER BY p.id').all(projectId),
+    acceptanceProposalRequests: db.prepare('SELECT r.* FROM acceptance_proposal_requests r JOIN acceptance_proposals p ON p.id = r.proposal_id JOIN changes c ON c.id = p.change_id WHERE c.project_id = ? ORDER BY r.request_id').all(projectId),
   };
 }
 

@@ -1,12 +1,13 @@
 import { test, expect, type Page } from '@playwright/test';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp } from 'node:fs/promises';
+import { rm } from './cleanup.js';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { buildApp } from '../../src/server/app.js';
 
 const pendingId = async (target: Page) => {
-  const text = await target.getByText(/待确认请求：/).textContent();
+  const text = await target.getByText(/待确认请求：/).textContent({ timeout: 8000 }).catch(error => { console.log('PENDING-ID-FAIL', Date.now(), error.message.split('\n')[0]); return ''; });
   return /待确认请求：([0-9a-f-]+)。/.exec(text ?? '')?.[1] ?? '';
 };
 const storedPointers = (target: Page) => target.evaluate(() => Object.keys(localStorage).filter(key => key.startsWith('specmill:pending-checkpoint-request:')));
@@ -172,14 +173,18 @@ test('a closed tab leaves only a request pointer for receipt verification', asyn
     await reopened.getByRole('button', { name: '登录' }).click();
     await reopened.getByRole('button', { name: '打开 指针项目' }).click();
     await expect(reopened.getByText('该请求的正文未保留')).toBeVisible();
+    console.log('T1 pointer-card-ok', Date.now());
     expect(await pendingId(reopened)).toBe(firstId);
     await expect(reopened.getByRole('button', { name: '按原请求重试' })).toHaveCount(0);
     // 原请求已在服务端提交，通过回执核对成功。
     await reopened.getByRole('button', { name: '查询保存回执' }).click();
+    console.log('T2 receipt-click-ok', Date.now());
     await expect(reopened.getByText('已确认保存进度。')).toBeVisible();
     await expect(reopened.getByText('保存点历史（1）')).toBeVisible();
     expect(await storedPointers(reopened)).toHaveLength(0);
   } finally {
+    // 先关闭所有页面：未关闭的标签页会以 keep-alive 连接阻塞 app.close()。
+    await context.close();
     await app.close();
     await rm(dataDir, { recursive: true, force: true });
     await rm(repoDir, { recursive: true, force: true });

@@ -1,6 +1,6 @@
 // 固定交接快照的内容与确定性渲染。快照在创建时捕获工作台记录，
 // 之后不随当前状态变化；渲染是内容到文本的纯函数。
-export type HandoffObservation = { id: string; path: string; bindingVersion: number; createdAt: string; head: string | null; branch: string | null; stable: boolean; limitations: string[]; files: { path: string; status: string; sha256?: string }[]; trackedDiffSha256: string | null };
+export type HandoffObservation = { id: string; workspaceId?: string; path: string; bindingVersion: number; createdAt: string; head: string | null; branch: string | null; stable: boolean; limitations: string[]; files: { path: string; status: string; sha256?: string }[]; trackedDiffSha256: string | null };
 export type HandoffCheckpoint = { id: string; recordVersion: number; actor: 'user' | 'agent'; createdAt: string; goal: string; done: string; failures: string; unverified: string; blockers: string; nextSteps: string; observation: HandoffObservation };
 export type HandoffBasis = { kind: 'baseline'; baselineId: string; revisionId: string; sourcePath: string; sourceSha256: string; sourceHead: string | null } | { kind: 'unconfirmedDraft'; revisionId: string };
 export type HandoffContent = {
@@ -40,7 +40,7 @@ export function renderHandoffMarkdown(content: HandoffContent): string {
         line('未验证', checkpoint.unverified),
         line('阻塞', checkpoint.blockers),
         line('下一步', checkpoint.nextSteps),
-        `工作区观察 ${checkpoint.observation.id}：路径 ${checkpoint.observation.path} · 绑定版本 ${checkpoint.observation.bindingVersion} · 时间 ${checkpoint.observation.createdAt} · HEAD ${checkpoint.observation.head ?? '尚无提交'} · 分支 ${checkpoint.observation.branch ?? '未关联分支'} · ${checkpoint.observation.stable ? '观察稳定' : '观察不稳定，需重新观察'}`,
+        `工作区观察 ${checkpoint.observation.id}：${checkpoint.observation.workspaceId ? `工作区 ${checkpoint.observation.workspaceId} · ` : ''}路径 ${checkpoint.observation.path} · 绑定版本 ${checkpoint.observation.bindingVersion} · 时间 ${checkpoint.observation.createdAt} · HEAD ${checkpoint.observation.head ?? '尚无提交'} · 分支 ${checkpoint.observation.branch ?? '未关联分支'} · ${checkpoint.observation.stable ? '观察稳定' : '观察不稳定，需重新观察'}`,
         `已跟踪差异摘要：${checkpoint.observation.trackedDiffSha256 ?? '未能读取'}`,
         '观察覆盖限制：',
         ...checkpoint.observation.limitations.map(item => `- ${item}`),
