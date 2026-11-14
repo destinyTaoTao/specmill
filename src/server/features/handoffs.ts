@@ -11,8 +11,8 @@ type Receipt = { requestId: string; resourceId: string; recordVersion: number; c
 export function registerHandoffs(app: FastifyInstance, db: Database.Database, recordsLimit: number) {
   app.get<{ Params: { changeId: string } }>('/api/v1/changes/:changeId/handoffs', async (request, reply) => {
     if (!db.prepare('SELECT 1 FROM changes WHERE id = ?').get(request.params.changeId)) return reply.code(404).send({ code: 'NOT_FOUND', message: '变更不存在。', requestId: request.id });
-    const rows = db.prepare('SELECT id, cycle, version, phase, content_json AS contentJson, created_at AS createdAt FROM handoff_snapshots WHERE change_id = ? ORDER BY created_at, id').all(request.params.changeId) as { contentJson: string }[];
-    return { snapshots: rows.map(({ contentJson, ...row }) => ({ ...row, changeTitle: (JSON.parse(contentJson) as HandoffContent).changeTitle })) };
+    const rows = db.prepare('SELECT id, cycle, version, phase, content_json AS contentJson, created_at AS createdAt FROM handoff_snapshots WHERE change_id = ? ORDER BY created_at, id').all(request.params.changeId) as { id: string; cycle: number; version: number; phase: string; contentJson: string; createdAt: string }[];
+    return { snapshots: rows.map(({ contentJson, ...row }) => ({ ...row, capturedVersion: row.version, changeTitle: (JSON.parse(contentJson) as HandoffContent).changeTitle })) };
   });
 
   app.get<{ Params: { snapshotId: string } }>('/api/v1/handoffs/:snapshotId', async (request, reply) => {

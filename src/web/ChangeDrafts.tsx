@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react';
 import { ApiError, readJson } from './api';
 import { BaselinePanel } from './BaselinePanel';
+import { HandoffPanel } from './HandoffPanel';
 import { WriterSessionPanel } from './WriterSessionPanel';
 
 type DraftFields = { title: string; goal: string; scope: string; nonGoals: string; criteria: string };
@@ -74,6 +75,7 @@ function DraftCard({ projectId, change, workspaces, refresh }: { projectId: stri
     {change.phase === 'Canceled' && <button disabled={busy || needsReload || (!!change.baselineId && !confirmBaseline)} onClick={() => { void transition('reopen'); }}>重新打开 {change.title}</button>}
     <button disabled={busy || needsReload} onClick={() => setShowBaseline(value => !value)}>规格 {change.title}</button>
     <WriterSessionPanel change={change} workspaces={workspaces} refresh={refresh} />
+    <HandoffPanel change={change} workspaces={workspaces} />
     {showBaseline && <BaselinePanel projectId={projectId} change={change} workspaces={workspaces} refresh={refresh} canAdopt={change.phase !== 'Canceled'} />}
   </section>;
 }
