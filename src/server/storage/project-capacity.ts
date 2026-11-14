@@ -36,6 +36,10 @@ export function projectRecords(db: Database.Database, projectId: string) {
     acceptanceProposalRequests: db.prepare('SELECT r.* FROM acceptance_proposal_requests r JOIN acceptance_proposals p ON p.id = r.proposal_id JOIN changes c ON c.id = p.change_id WHERE c.project_id = ? ORDER BY r.request_id').all(projectId),
     attachments: db.prepare('SELECT a.* FROM attachments a WHERE a.project_id = ? ORDER BY a.id').all(projectId),
     attachmentRequests: db.prepare('SELECT r.* FROM attachment_requests r JOIN attachments a ON a.id = r.attachment_id WHERE a.project_id = ? ORDER BY r.request_id').all(projectId),
+    reviewPreviews: db.prepare('SELECT p.* FROM review_previews p WHERE p.project_id = ? ORDER BY p.id').all(projectId),
+    decisions: db.prepare('SELECT d.* FROM decisions d WHERE d.project_id = ? ORDER BY d.id').all(projectId),
+    failureDispositions: db.prepare('SELECT f.* FROM failure_dispositions f WHERE f.project_id = ? ORDER BY f.id').all(projectId),
+    reviewRequests: db.prepare('SELECT r.* FROM review_requests r WHERE r.resource_id IN (SELECT id FROM review_previews WHERE project_id = ?) OR r.resource_id IN (SELECT id FROM decisions WHERE project_id = ?) OR r.resource_id IN (SELECT id FROM failure_dispositions WHERE project_id = ?) OR r.resource_id IN (SELECT id FROM changes WHERE project_id = ?)').all(projectId, projectId, projectId, projectId),
   };
 }
 

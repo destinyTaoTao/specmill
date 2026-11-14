@@ -66,6 +66,8 @@ export function EvidencePanel({ projectId, change, refresh }: { projectId: strin
       await readJson(await fetch(`/api/v1/changes/${change.id}/acceptance-targets/${encodeURIComponent(id)}/confirm`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-SpecMill-Request': '1' }, body: JSON.stringify({ requestId: confirmId.current }) }), '确认实现目标失败。');
       confirmId.current = crypto.randomUUID();
       await reload();
+      // 目标确认影响审阅面板的上下文：通过事件通知其重新读取。
+      window.dispatchEvent(new Event('specmill:review-refresh'));
       setNotice('已确认实现目标（完整 commit 及仓库身份）。');
     } catch (err) { setError(err instanceof ApiError ? err.message : '确认结果未知，可重试。'); } finally { setBusy(false); }
   }

@@ -118,9 +118,10 @@ export function registerChanges(app: FastifyInstance, db: Database.Database, rec
       const change = db.prepare('SELECT project_id AS projectId, phase, cycle, version, current_baseline_id AS baselineId FROM changes WHERE id = ?').get(changeId) as { projectId: string; phase: string; cycle: number; version: number; baselineId: string | null } | undefined;
       if (!change) return 'NOT_FOUND';
       if (change.version !== expectedVersion) return { currentVersion: change.version };
-      if ((action === 'cancel' && change.phase !== 'Draft' && change.phase !== 'Working' && change.phase !== 'Reviewing') || (action === 'reopen' && change.phase !== 'Canceled')) return 'INVALID_STATE';
+      if ((action === 'cancel' && change.phase !== 'Draft' && change.phase !== 'Working' && change.phase !== 'Reviewing') || (action === 'reopen' && change.phase !== 'Canceled' && change.phase !== 'Accepted')) return 'INVALID_STATE';
       if (action === 'reopen' && change.baselineId !== null && payload.baselineId !== change.baselineId) return 'BASELINE_CONFIRMATION_REQUIRED';
       if (action === 'reopen' && change.baselineId === null && payload.baselineId !== undefined) return 'INVALID_STATE';
+      if (action === 'reopen' && change.phase === 'Accepted' && !payload.reason?.trim()) return 'REASON_REQUIRED';
       const before = projectRecordBytes(db, change.projectId);
       const to = action === 'cancel' ? 'Canceled' : change.baselineId === null ? 'Draft' : 'Working';
       const cycle = action === 'reopen' ? change.cycle + 1 : change.cycle;

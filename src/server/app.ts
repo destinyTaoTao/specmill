@@ -12,6 +12,7 @@ import { registerWriterSessions } from './features/writer-sessions.js';
 import { registerCheckpoints } from './features/checkpoints.js';
 import { registerHandoffs } from './features/handoffs.js';
 import { registerEvidence } from './features/evidence.js';
+import { registerReview } from './features/review.js';
 import { checkProjectCapacity, DEFAULT_RECORDS_LIMIT, ProjectCapacityExceeded } from './storage/project-capacity.js';
 import { requestIdUsedElsewhere } from './storage/request-ids.js';
 
@@ -37,7 +38,7 @@ export async function buildApp(options: AppOptions) {
     const version = (db.prepare('select sqlite_version() as version').get() as {version: string}).version.split('.').map(Number);
     if (version[0] < 3 || (version[0] === 3 && (version[1] < 51 || (version[1] === 51 && version[2] < 3)))) throw new Error('SQLite 3.51.3 or later required');
     const schemaVersion = db.pragma('user_version', { simple: true }) as number;
-    if (schemaVersion > 13) throw new Error('Unsupported database schema');
+    if (schemaVersion > 14) throw new Error('Unsupported database schema');
     db.pragma('journal_mode = WAL'); db.pragma('locking_mode = EXCLUSIVE'); db.pragma('foreign_keys = ON'); db.pragma('synchronous = FULL'); db.pragma('busy_timeout = 5000');
     db.exec('BEGIN EXCLUSIVE; COMMIT');
     if (schemaVersion === 0) db.transaction(() => {
@@ -208,6 +209,20 @@ export async function buildApp(options: AppOptions) {
           PRAGMA user_version = 13`);
       })();
     }
+    if (schemaVersion < 14) {
+      if (schemaVersion === 13) {
+        const backupDir = join(dir, 'backups');
+        await mkdir(backupDir, { recursive: true });
+        await db.backup(join(backupDir, `before-schema-14-${randomUUID()}.db`));
+      }
+      db.transaction(() => {
+        db!.exec(`CREATE TABLE review_previews (id TEXT PRIMARY KEY, change_id TEXT NOT NULL REFERENCES changes(id), project_id TEXT NOT NULL REFERENCES projects(id), cycle INTEGER NOT NULL, baseline_id TEXT NOT NULL REFERENCES baselines(id), criterion_revision_id TEXT NOT NULL, target_id TEXT, record_version INTEGER NOT NULL, evidence_count INTEGER NOT NULL, decision_count INTEGER NOT NULL, disposition_count INTEGER NOT NULL, selections_json TEXT NOT NULL, created_at TEXT NOT NULL);
+          CREATE TABLE decisions (id TEXT PRIMARY KEY, change_id TEXT NOT NULL REFERENCES changes(id), project_id TEXT NOT NULL REFERENCES projects(id), cycle INTEGER NOT NULL, baseline_id TEXT NOT NULL REFERENCES baselines(id), criterion_revision_id TEXT NOT NULL, criterion_id TEXT NOT NULL, target_id TEXT, result TEXT NOT NULL, evidence_ids_json TEXT NOT NULL, reason TEXT NOT NULL, actor TEXT NOT NULL, preview_id TEXT, superseded_by TEXT, created_at TEXT NOT NULL);
+          CREATE TABLE failure_dispositions (id TEXT PRIMARY KEY, change_id TEXT NOT NULL REFERENCES changes(id), project_id TEXT NOT NULL REFERENCES projects(id), cycle INTEGER NOT NULL, baseline_id TEXT NOT NULL, criterion_id TEXT NOT NULL, failure_evidence_id TEXT NOT NULL REFERENCES evidence_records(id), outcome TEXT NOT NULL, supporting_evidence_ids_json TEXT NOT NULL, reason TEXT NOT NULL, actor TEXT NOT NULL, created_at TEXT NOT NULL);
+          CREATE TABLE review_requests (request_id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, resource_id TEXT NOT NULL, action TEXT NOT NULL, record_version INTEGER, committed_at TEXT NOT NULL);
+          PRAGMA user_version = 14`);
+      })();
+    }
     db.transaction(() => {
       db!.exec("UPDATE changes SET version = version + 1 WHERE id IN (SELECT change_id FROM writer_sessions WHERE status = 'active')");
       db!.prepare("UPDATE writer_sessions SET status = 'interrupted', ended_at = ? WHERE status = 'active'").run(new Date().toISOString());
@@ -239,7 +254,7 @@ export async function buildApp(options: AppOptions) {
       const agent = !!bearer && equal(bearer, options.agentToken);
       if (!owner && !agent) return sendError(request, reply, 401, 'UNAUTHORIZED', '请先登录工作台。');
       if (request.method !== 'GET') {
-        const agentRoute = request.method === 'POST' && (route === '/api/v1/changes/:changeId/writer-sessions' || route === '/api/v1/writer-sessions/:sessionId/release' || route === '/api/v1/changes/:changeId/checkpoints' || route === '/api/v1/workspaces/:workspaceId/observations' || route === '/api/v1/changes/:changeId/handoffs' || route === '/api/v1/changes/:changeId/executions' || route === '/api/v1/changes/:changeId/evidence' || route === '/api/v1/changes/:changeId/acceptance-targets' || route === '/api/v1/changes/:changeId/acceptance-proposals' || route === '/api/v1/projects/:projectId/attachments');
+        const agentRoute = request.method === 'POST' && (route === '/api/v1/changes/:changeId/writer-sessions' || route === '/api/v1/writer-sessions/:sessionId/release' || route === '/api/v1/changes/:changeId/checkpoints' || route === '/api/v1/workspaces/:workspaceId/observations' || route === '/api/v1/changes/:changeId/handoffs' || route === '/api/v1/changes/:changeId/executions' || route === '/api/v1/changes/:changeId/evidence' || route === '/api/v1/changes/:changeId/acceptance-targets' || route === '/api/v1/changes/:changeId/acceptance-proposals' || route === '/api/v1/projects/:projectId/attachments' || route === '/api/v1/changes/:changeId/review/preview' || route === '/api/v1/changes/:changeId/review/failure-dispositions/preview');
         if (owner ? !requestOrigin || request.headers['x-specmill-request'] !== '1' : !agent || !agentRoute) return sendError(request, reply, 403, 'FORBIDDEN', '没有执行此操作的权限。');
       }
     });
@@ -280,6 +295,7 @@ export async function buildApp(options: AppOptions) {
     registerCheckpoints(app, db, recordsLimit, isOwner, authorizeWriter);
     registerHandoffs(app, db, recordsLimit);
     registerEvidence(app, db, recordsLimit, join(dir, 'attachments'));
+    registerReview(app, db, recordsLimit, join(dir, 'attachments'));
     app.setErrorHandler((error, request, reply) => {
       if (error instanceof ProjectCapacityExceeded) return reply.code(413).send({ code: error.code, message: error.message, requestId: request.id, dimension: error.dimension, used: error.used, requestedIncrement: error.requestedIncrement, limit: error.limit });
       const errorStatus = typeof error === 'object' && error !== null && 'statusCode' in error ? error.statusCode : undefined;

@@ -98,7 +98,7 @@ describe('writer sessions', () => {
   }, 15000);
 
   it('reserves capacity to release even when the project approaches its limit', async () => {
-    const { app, projectId, workspaceId, changeId, ownerHeaders } = await setup(8000);
+    const { app, projectId, workspaceId, changeId, ownerHeaders } = await setup(12000);
     const started = await start(app, changeId, workspaceId, 'bounded-start');
     expect(started.statusCode).toBe(201);
     const capacity = async () => (await app.inject({ url: `/api/v1/projects/${projectId}/capacity`, headers: ownerHeaders })).json().records as { used: number; limit: number };
@@ -145,7 +145,7 @@ describe('writer sessions', () => {
   }, 15000);
 
   it('takes over near the capacity limit and rolls back atomically when the increment does not fit', async () => {
-    const { app, projectId, workspaceId, changeId, ownerHeaders } = await setup(8000);
+    const { app, projectId, workspaceId, changeId, ownerHeaders } = await setup(12000);
     const started = await start(app, changeId, workspaceId, 'bounded-start');
     expect(started.statusCode).toBe(201);
     const capacity = async () => (await app.inject({ url: `/api/v1/projects/${projectId}/capacity`, headers: ownerHeaders })).json().records as { used: number; limit: number };
@@ -164,6 +164,7 @@ describe('writer sessions', () => {
     const perFill = (await capacity()).used - beforeProbe.used;
     await fill('0001', Math.max(0, Math.floor((await remaining() - 1800 - perFill) / 2)));
     const beforeTakeover = await remaining();
+    console.log('CAP-DEBUG beforeTakeover', beforeTakeover, 'perFill', perFill);
     expect(beforeTakeover).toBeGreaterThan(0);
     // 接管前后都占用一个活跃会话：接近上限时接管仍应成功
     const nearLimit = await takeover('near-limit-takeover', started.json(), 1, 2);
@@ -171,16 +172,21 @@ describe('writer sessions', () => {
     const second = nearLimit.json();
     expect(second.generation).toBe(2);
     const increment = beforeTakeover - await remaining();
+    console.log('CAP-DEBUG increment', increment, 'gap', await remaining());
     // 填充到剩余不足一次接管的开销（旧会话历史、新会话与回执）后应 413
     const gap = await remaining();
     if (gap >= perFill) {
       const extra = gap - perFill - Math.floor(increment / 2);
       await fill('0002', extra >= 0 ? Math.floor(extra / 2) : 0);
     }
+    for (let guard = 0; (await remaining()) >= increment && guard < 10; guard++) {
+      if ((await remaining()) < perFill) break;
+      await fill(`0002-${guard}`, 0);
+    }
     expect(await remaining()).toBeLessThan(increment);
     const rejected = await takeover('tight-takeover', second, 2, 3);
     expect(rejected.statusCode).toBe(413);
-    expect(rejected.json()).toEqual(expect.objectContaining({ code: 'PROJECT_CAPACITY_EXCEEDED', dimension: 'records', limit: 8000 }));
+    expect(rejected.json()).toEqual(expect.objectContaining({ code: 'PROJECT_CAPACITY_EXCEEDED', dimension: 'records', limit: 12000 }));
     // 回执未记录、会话历史与变更版本未前进，撤销是原子的
     expect((await app.inject({ url: '/api/v1/receipts/tight-takeover', headers: ownerHeaders })).statusCode).toBe(404);
     const history = await app.inject({ url: `/api/v1/changes/${changeId}/writer-sessions`, headers: agentHeaders });

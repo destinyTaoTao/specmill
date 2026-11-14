@@ -3,10 +3,11 @@ import { ApiError, readJson } from './api';
 import { BaselinePanel } from './BaselinePanel';
 import { EvidencePanel } from './EvidencePanel';
 import { HandoffPanel } from './HandoffPanel';
+import { ReviewPanel } from './ReviewPanel';
 import { WriterSessionPanel } from './WriterSessionPanel';
 
 type DraftFields = { title: string; goal: string; scope: string; nonGoals: string; criteria: string };
-type Change = { id: string; phase: 'Draft' | 'Working' | 'Reviewing' | 'Canceled'; cycle: number; version: number; baselineId: string | null; title: string; goal: string; scope: string; nonGoals: string; criteria: string[] };
+type Change = { id: string; phase: 'Draft' | 'Working' | 'Reviewing' | 'Accepted' | 'Canceled'; cycle: number; version: number; baselineId: string | null; title: string; goal: string; scope: string; nonGoals: string; criteria: string[] };
 type Workspace = { id: string; path: string; version: number };
 type Transition = { id: string; from: string; to: string; cycle: number; reason: string; createdAt: string };
 const emptyDraft = (): DraftFields => ({ title: '', goal: '', scope: '', nonGoals: '', criteria: '' });
@@ -31,6 +32,7 @@ function DraftCard({ projectId, change, workspaces, refresh }: { projectId: stri
   const [cancelVersion, setCancelVersion] = useState(change.version);
   const [showBaseline, setShowBaseline] = useState(false);
   const [confirmBaseline, setConfirmBaseline] = useState(false);
+  const [reopenDraft, setReopenDraft] = useState(false);
   const [reason, setReason] = useState('');
   const [busy, setBusy] = useState(false);
   const [needsReload, setNeedsReload] = useState(false);
@@ -58,12 +60,12 @@ function DraftCard({ projectId, change, workspaces, refresh }: { projectId: stri
     setBusy(true); setError('');
     try {
       await readJson(await fetch(`/api/v1/changes/${change.id}/${action}`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-SpecMill-Request': '1' },
-        body: JSON.stringify({ requestId: transitionId.current, expectedVersion: action === 'cancel' ? cancelVersion : change.version, payload: action === 'cancel' ? { reason } : change.baselineId ? { baselineId: change.baselineId } : {} }) }), '操作失败。');
+        body: JSON.stringify({ requestId: transitionId.current, expectedVersion: action === 'cancel' ? cancelVersion : change.version, payload: action === 'cancel' ? { reason } : change.baselineId ? { baselineId: change.baselineId, ...(change.phase === 'Accepted' ? { reason } : {}) } : {} }) }), '操作失败。');
       transitionId.current = crypto.randomUUID(); setCanceling(false); setReason(''); setConfirmBaseline(false);
       try { await refresh(); } catch { setNeedsReload(true); setError('操作已保存，但刷新失败；请返回后重新打开项目。'); }
     } catch (err) { setError(err instanceof ApiError ? err.message : '操作结果未知，可用原内容重试。'); } finally { setBusy(false); }
   }
-  const phase = change.phase === 'Draft' ? `草案 · 周期 ${change.cycle}` : change.phase === 'Working' ? `开发中 · 周期 ${change.cycle}` : change.phase === 'Reviewing' ? `审阅中 · 周期 ${change.cycle}` : '已取消';
+  const phase = change.phase === 'Draft' ? `草案 · 周期 ${change.cycle}` : change.phase === 'Working' ? `开发中 · 周期 ${change.cycle}` : change.phase === 'Reviewing' ? `审阅中 · 周期 ${change.cycle}` : change.phase === 'Accepted' ? `已验收 · 周期 ${change.cycle}` : '已取消';
   return <section><h4>{change.title}</h4><p>{phase} · 版本 {change.version}</p>
     {error && <p role="alert">{error}</p>}
     <p>{change.goal || '尚未填写目标'}</p>
@@ -74,10 +76,13 @@ function DraftCard({ projectId, change, workspaces, refresh }: { projectId: stri
     {canceling && <form onSubmit={event => { event.preventDefault(); void transition('cancel'); }}><label>取消原因<input disabled={busy || needsReload} required value={reason} onChange={event => { setReason(event.target.value); transitionId.current = crypto.randomUUID(); }} /></label><button disabled={busy || needsReload}>确认取消</button></form>}
     {change.phase === 'Canceled' && change.baselineId && <label><input type="checkbox" disabled={busy || needsReload} checked={confirmBaseline} onChange={event => setConfirmBaseline(event.target.checked)} />确认继续采用已有规格基线</label>}
     {change.phase === 'Canceled' && <button disabled={busy || needsReload || (!!change.baselineId && !confirmBaseline)} onClick={() => { void transition('reopen'); }}>重新打开 {change.title}</button>}
+    {change.phase === 'Accepted' && !reopenDraft && <button disabled={busy || needsReload} onClick={() => setReopenDraft(true)}>重新打开 {change.title}</button>}
+    {reopenDraft && change.phase === 'Accepted' && <form aria-label="重新打开变更" onSubmit={event => { event.preventDefault(); void transition('reopen'); }}><label>重新打开原因<input disabled={busy || needsReload} required value={reason} onChange={event => { setReason(event.target.value); transitionId.current = crypto.randomUUID(); }} /></label><button disabled={busy || needsReload}>确认重新打开</button></form>}
     <button disabled={busy || needsReload} onClick={() => setShowBaseline(value => !value)}>规格 {change.title}</button>
     <WriterSessionPanel change={change} workspaces={workspaces} refresh={refresh} />
     <HandoffPanel change={change} workspaces={workspaces} />
     <EvidencePanel projectId={projectId} change={change} refresh={refresh} />
+    {change.phase === 'Reviewing' || change.phase === 'Accepted' ? <ReviewPanel change={change} refresh={refresh} /> : null}
     {showBaseline && <BaselinePanel projectId={projectId} change={change} workspaces={workspaces} refresh={refresh} canAdopt={change.phase !== 'Canceled'} />}
   </section>;
 }

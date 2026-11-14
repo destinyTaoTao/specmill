@@ -71,6 +71,9 @@ async function main() {
             : group === 'proposal' && action === 'list' ? ['--change']
           : group === 'attachment' && action === 'add' ? ['--project', '--file', '--filename', '--content-type', '--request-id']
             : group === 'attachment' && action === 'list' ? ['--project']
+          : group === 'review' && action === 'show' ? ['--change']
+            : group === 'review' && action === 'preview' ? ['--change', '--file', '--request-id']
+              : group === 'review' && action === 'disposition-preview' ? ['--change', '--file', '--request-id']
           : group === 'session' && action === 'start' ? ['--change', '--workspace', '--binding-version', '--version', '--tool', '--request-id', '--grant-file']
             : group === 'session' && action === 'release' ? ['--grant-file', '--version', '--request-id'] : null;
   if (!allowed || [...flags.keys()].some(key => !allowedCommon.includes(key) && !allowed.includes(key))) throw new CliError('INVALID_ARGUMENT', '命令或参数无效。', 2);
@@ -245,6 +248,19 @@ async function main() {
     result = await requestRaw(`/api/v1/projects/${encodeURIComponent(required('--project'))}/attachments?${query.toString()}`, content);
   } else if (group === 'attachment' && action === 'list') {
     result = await request(`/api/v1/projects/${encodeURIComponent(required('--project'))}/attachments`);
+  } else if (group === 'review' && action === 'show') {
+    result = await request(`/api/v1/changes/${encodeURIComponent(required('--change'))}/review`);
+  } else if (group === 'review' && action === 'preview') {
+    let selections: unknown;
+    try { selections = JSON.parse(await boundedInput(createReadStream(resolve(required('--file'))))); }
+    catch { throw new CliError('INPUT_ERROR', '无法读取选择文件。', 6); }
+    result = await request(`/api/v1/changes/${encodeURIComponent(required('--change'))}/review/preview`, { requestId: required('--request-id'), payload: { selections } });
+  } else if (group === 'review' && action === 'disposition-preview') {
+    let rows: unknown;
+    try { rows = JSON.parse(await boundedInput(createReadStream(resolve(required('--file'))))); }
+    catch { throw new CliError('INPUT_ERROR', '无法读取处置行文件。', 6); }
+    const version = number('--version');
+    result = await request(`/api/v1/changes/${encodeURIComponent(required('--change'))}/review/failure-dispositions/preview`, { requestId: required('--request-id'), expectedVersion: version, payload: { rows } });
   } else if (group === 'session' && action === 'start') {
     const changeId = required('--change');
     const requestId = required('--request-id');

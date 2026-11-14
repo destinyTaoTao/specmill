@@ -4,6 +4,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { checkProjectCapacity, projectRecordBytes } from '../storage/project-capacity.js';
+import { checkAttachmentHealth, attachmentPathFor } from '../storage/attachments.js';
 import { requestIdUsedElsewhere } from '../storage/request-ids.js';
 import { containsCommits, identifyWorkspace, ObservationTempInsideWorkspace, observeWorkspace, pathKey } from '../workspace/git.js';
 
@@ -16,14 +17,9 @@ type ChangeRow = { projectId: string; phase: string; cycle: number; version: num
 
 export function registerEvidence(app: FastifyInstance, db: Database.Database, recordsLimit: number, attachmentsDir: string) {
   const getChange = (changeId: string) => db.prepare('SELECT id, project_id AS projectId, phase, cycle, version FROM changes WHERE id = ?').get(changeId) as ChangeRow | undefined;
-  const attachmentPath = (projectId: string, sha256: string) => join(attachmentsDir, projectId, sha256);
+  const attachmentPath = (projectId: string, sha256: string) => attachmentPathFor(attachmentsDir, projectId, sha256);
   // 附件健康：文件存在且摘要与记录一致；损坏与缺失都明确暴露，不伪报成功。
-  const attachmentHealth = async (attachment: { projectId: string; sha256: string; size: number }) => {
-    try {
-      const content = await readFile(attachmentPath(attachment.projectId, attachment.sha256));
-      return createHash('sha256').update(content).digest('hex') === attachment.sha256 && content.length === attachment.size ? 'ok' : 'corrupted';
-    } catch { return 'missing'; }
-  };
+  const attachmentHealth = (attachment: { projectId: string; sha256: string; size: number }) => checkAttachmentHealth(attachmentsDir, attachment.projectId, attachment.sha256, attachment.size);
   const boundWorkspace = (projectId: string) => db.prepare('SELECT w.id, w.path, w.common_key AS commonKey FROM workspaces w JOIN project_repositories p ON p.project_id = w.project_id WHERE w.project_id = ? AND w.common_key = p.common_key ORDER BY w.rowid DESC LIMIT 1').get(projectId) as { id: string; path: string; commonKey: string } | undefined;
   const freshObservation = async (workspace: { id: string; path: string; commonKey: string }) => {
     try {
@@ -101,7 +97,7 @@ export function registerEvidence(app: FastifyInstance, db: Database.Database, re
       await writeFile(path, content, { flag: 'wx' });
     } catch (error) {
       if (typeof error === 'object' && error !== null && 'code' in error && error.code === 'EEXIST') {
-        const onDisk = await readFile(path).then(data => createHash('sha256').update(data).digest('hex')).catch(() => '');
+        const onDisk = await readFile(path).then((data: Buffer) => createHash('sha256').update(data).digest('hex')).catch(() => '');
         if (onDisk !== sha256) return reply.code(503).send({ code: 'ATTACHMENT_CORRUPTED', message: '存储中已有同地址内容且摘要不符，请核对存储完整性。', requestId: request.id });
       } else {
         return reply.code(503).send({ code: 'STORAGE_WRITE_FAILED', message: '附件写入存储失败；未登记引用。', requestId: request.id });
