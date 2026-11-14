@@ -6,3 +6,17 @@
 - 不擅自扩展多人协作、远程服务、自动运行 agent、Spec Kit 自动导入或双向 Markdown 同步。
 - 按功能变更运行相关检查；涉及会话并发、验收和恢复时覆盖失败路径。测试使用隔离的临时数据目录与 Git 仓库。
 - 工作台数据、附件、凭据及个人项目内容不得提交。Git 提交、推送和公开发布遵循用户当前授权。
+
+## Agent skills
+
+### Issue tracker
+
+使用本仓库的 GitHub Issues 跟踪工作；详见 `docs/agents/issue-tracker.md`。
+
+### Triage labels
+
+使用默认的五个分诊标签；详见 `docs/agents/triage-labels.md`。
+
+### Domain docs
+
+使用单上下文领域文档布局；详见 `docs/agents/domain.md`。

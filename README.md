@@ -2,9 +2,17 @@
 
 面向个人开发者的本机开发续做工作台，帮助跨会话、跨工具保存和接续开发上下文。
 
-当前处于项目初始化阶段，仅包含前端启动骨架和方案文档；服务、CLI、存储和续做流程尚未实现。
+当前是开发中的首版：已有本机项目与 Git 工作区、Markdown 规格基线、单写会话、保存点和部分 CLI。固定交接材料、正式验收、项目导出恢复及首版完整闭环仍未实现；尚未完成真实双工具价值验证。继续开发前请阅读[实施状态与交接](docs/agents/2026-11-14-mvp-handoff.md)。
 
-需要 Node.js 24 和 npm。安装依赖后运行 `npm run dev`；运行 `npm run typecheck` 和 `npm run build` 检查骨架。
+需要 Node.js 24.22.3 或更高的 24.x 版本和 npm；项目用 `.node-version` 指定开发基线。运行 `npm ci` 安装依赖，运行 `npm run build` 后运行 `npm start`。在浏览器打开终端显示的本机地址，使用终端中的一次性启动口令登录。重启后口令和浏览器会话均失效。
+
+默认数据存放在 Windows 的 `%LOCALAPPDATA%/SpecMill`；可用 `npm start -- --data-dir <目录> --port <端口>` 指定其他目录和端口。数据目录只允许一个服务实例使用；请勿提交数据库、附件或口令。运行 `npm test`、`npm run lint`、`npm run typecheck` 和 `npm run build` 验证。
+
+服务被强制终止后，单实例锁可能短暂保留；确认旧进程已退出后稍等，再重新启动。浏览器测试需安装 Playwright Chromium，或设置 `SPECMILL_TEST_CHROME` 指向本机 Chrome 后运行 `npm run test:e2e`。
+
+构建后可通过 `npm run cli -- project list --json` 查看项目，再使用 `workspace list --project <项目ID>`、`change list --project <项目ID>` 和 `change show --change <变更ID>` 查询。CLI 的会话、观察、保存点和回执命令及其当前限制见交接文档。CLI 只访问本机服务；Windows 下凭据及 CLI 的标准输入暂存使用当前 Windows 用户的系统加密。
+
+保存点提交结果未知时，浏览器会临时保留正文和请求信息，以便刷新后查询回执；这份副本位于浏览器站点存储，**不在工作台数据目录或恢复包中，且目前为明文**。不要把敏感信息放入进度正文；多标签页同时操作同一变更仍有待修复，详见交接文档。
 
 - [项目方案](docs/01-项目愿景与方案总览.md)
 - [首版详细设计](docs/02-首版详细设计.md)

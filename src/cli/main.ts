@@ -1,0 +1,188 @@
+import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { createReadStream } from 'node:fs';
+import { randomBytes, randomUUID } from 'node:crypto';
+import { homedir } from 'node:os';
+import { join, resolve } from 'node:path';
+import { decodeSecret, encodeSecret } from '../shared/credentials.js';
+
+class CliError extends Error {
+  constructor(readonly code: string, message: string, readonly exitCode: number, readonly details: Record<string, unknown> = {}) { super(message); }
+}
+type Grant = { requestId: string; sessionId?: string; generation?: number; writerToken: string };
+class InputTooLarge extends Error {}
+let pendingInputFile: string | undefined;
+async function boundedInput(source: AsyncIterable<unknown>, limit = 1024 * 1024) {
+  const chunks: Buffer[] = []; let size = 0;
+  for await (const chunk of source) {
+    const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk));
+    size += bytes.length;
+    if (size > limit) throw new InputTooLarge();
+    chunks.push(bytes);
+  }
+  return new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks));
+}
+
+async function main() {
+  const args = process.argv.slice(2);
+  const [group, action, ...rest] = args;
+  const flags = new Map<string, string>();
+  let json = false;
+  let stdin = false;
+  for (let i = 0; i < rest.length; i++) {
+    const key = rest[i];
+    if (key === '--json') { json = true; continue; }
+    if (key === '--stdin') { if (stdin) throw new CliError('INVALID_ARGUMENT', '参数重复。', 2); stdin = true; continue; }
+    if (!key.startsWith('--') || !rest[i + 1] || rest[i + 1].startsWith('--') || flags.has(key)) throw new CliError('INVALID_ARGUMENT', '参数无效或重复。', 2);
+    flags.set(key, rest[++i]);
+  }
+  const required = (key: string) => {
+    const value = flags.get(key);
+    if (!value) throw new CliError('INVALID_ARGUMENT', `缺少参数 ${key}。`, 2);
+    return value;
+  };
+  const number = (key: string) => {
+    const raw = required(key);
+    const value = Number(raw);
+    if (!/^\d+$/.test(raw) || !Number.isSafeInteger(value) || value < 1) throw new CliError('INVALID_ARGUMENT', `${key} 必须是正整数。`, 2);
+    return value;
+  };
+  let server: URL;
+  try { server = new URL(flags.get('--server') ?? 'http://127.0.0.1:43127'); }
+  catch { throw new CliError('INVALID_SERVER', '服务地址无效。', 2); }
+  if (server.protocol !== 'http:' || server.hostname !== '127.0.0.1' || server.username || server.password || server.pathname !== '/' || server.search || server.hash) throw new CliError('INVALID_SERVER', 'CLI 只连接本机 127.0.0.1 服务。', 2);
+  const allowedCommon = ['--server', '--data-dir'];
+  const allowed = group === 'project' && action === 'list' ? []
+    : group === 'workspace' && action === 'list' ? ['--project']
+      : group === 'workspace' && action === 'observe' ? ['--workspace', '--binding-version', '--grant-file', '--request-id', '--untracked-file']
+      : group === 'change' && action === 'list' ? ['--project']
+        : group === 'change' && action === 'show' ? ['--change']
+          : group === 'checkpoint' && action === 'list' ? ['--change']
+            : group === 'checkpoint' && action === 'save' ? ['--change', '--grant-file', '--version', '--observation', '--request-id', '--file', '--pending-file']
+              : group === 'receipt' && action === 'show' ? ['--request-id']
+          : group === 'session' && action === 'start' ? ['--change', '--workspace', '--binding-version', '--version', '--tool', '--request-id', '--grant-file']
+            : group === 'session' && action === 'release' ? ['--grant-file', '--version', '--request-id'] : null;
+  if (!allowed || [...flags.keys()].some(key => !allowedCommon.includes(key) && !allowed.includes(key))) throw new CliError('INVALID_ARGUMENT', '命令或参数无效。', 2);
+  for (const key of allowed.filter(key => key !== '--untracked-file' && key !== '--file' && key !== '--pending-file')) required(key);
+  if (group === 'checkpoint' && action === 'save') {
+    if (Number(stdin) + Number(flags.has('--file')) + Number(flags.has('--pending-file')) !== 1) throw new CliError('INVALID_ARGUMENT', '请指定 --file、--stdin 或 --pending-file 其中之一。', 2);
+  } else if (stdin) throw new CliError('INVALID_ARGUMENT', '此命令不支持 --stdin。', 2);
+  if (flags.has('--version')) number('--version');
+  if (flags.has('--binding-version')) number('--binding-version');
+  const dataDir = resolve(flags.get('--data-dir') ?? join(process.env.LOCALAPPDATA ?? join(homedir(), '.local', 'share'), 'SpecMill'));
+  let agentToken: string;
+  try { agentToken = await decodeSecret((await readFile(join(dataDir, 'cli-token'), 'utf8')).trim()); }
+  catch { throw new CliError('SERVICE_UNAVAILABLE', '无法读取 CLI 凭据，请先启动本机服务并检查数据目录。', 6); }
+  if (!agentToken) throw new CliError('SERVICE_UNAVAILABLE', 'CLI 凭据为空，请重启本机服务。', 6);
+  async function request(path: string, body?: unknown, writerToken?: string) {
+    let response: Response;
+    try {
+      response = await fetch(new URL(path, server), { method: body === undefined ? 'GET' : 'POST', redirect: 'error', headers: { Authorization: `Bearer ${agentToken}`, ...(body === undefined ? {} : { 'Content-Type': 'application/json' }), ...(writerToken ? { 'X-SpecMill-Writer-Token': writerToken } : {}) }, ...(body === undefined ? {} : { body: JSON.stringify(body) }), signal: AbortSignal.timeout(30000) });
+    } catch { throw new CliError('SERVICE_UNAVAILABLE', '无法连接本机服务；写入结果可能未知，请使用原请求标识重试。', 6); }
+    const value = await response.json().catch(() => null) as Record<string, unknown> | null;
+    if (!response.ok) {
+      const exitCode = response.status === 401 || response.status === 403 ? 4 : response.status === 409 ? 3 : response.status === 422 ? 5 : response.status === 400 || response.status === 413 ? 2 : 6;
+      const details = Object.fromEntries(['requestId', 'currentVersion', 'dimension', 'used', 'requestedIncrement', 'limit'].filter(key => value?.[key] !== undefined).map(key => [key, value?.[key]]));
+      throw new CliError(typeof value?.code === 'string' ? value.code : 'SERVICE_ERROR', typeof value?.message === 'string' ? value.message : '本机服务请求失败。', exitCode, details);
+    }
+    if (!value || typeof value !== 'object' || Array.isArray(value)) throw new CliError('INVALID_RESPONSE', '服务响应不完整；写入结果可能未知，请使用原请求标识重试。', 6);
+    return value;
+  }
+  async function readGrant() {
+    let grant: Grant;
+    try { grant = JSON.parse(await decodeSecret(await readFile(resolve(required('--grant-file')), 'utf8'))) as Grant; }
+    catch { throw new CliError('GRANT_FILE_ERROR', '无法读取写会话授权文件。', 6); }
+    if (typeof grant.sessionId !== 'string' || typeof grant.generation !== 'number' || typeof grant.writerToken !== 'string') throw new CliError('GRANT_FILE_ERROR', '写会话授权文件无效。', 2);
+    return grant as Grant & { sessionId: string; generation: number };
+  }
+  let result: Record<string, unknown>;
+  if (group === 'project' && action === 'list') {
+    result = await request('/api/v1/projects');
+  } else if (group === 'workspace' && action === 'list') {
+    result = await request(`/api/v1/projects/${encodeURIComponent(required('--project'))}/workspaces`);
+  } else if (group === 'workspace' && action === 'observe') {
+    const grant = await readGrant();
+    let selectedUntracked: string[] = [];
+    if (flags.has('--untracked-file')) {
+      try { selectedUntracked = (await boundedInput(createReadStream(resolve(required('--untracked-file'))))).split(/\r?\n/).filter(Boolean); }
+      catch { throw new CliError('INPUT_ERROR', '无法读取未跟踪文件列表。', 6); }
+    }
+    result = await request(`/api/v1/workspaces/${encodeURIComponent(required('--workspace'))}/observations`, { requestId: required('--request-id'), expectedBindingVersion: number('--binding-version'), selectedUntracked, writerSessionId: grant.sessionId, generation: grant.generation }, grant.writerToken);
+  } else if (group === 'change' && action === 'list') {
+    result = await request(`/api/v1/projects/${encodeURIComponent(required('--project'))}/changes`);
+  } else if (group === 'change' && action === 'show') {
+    result = await request(`/api/v1/changes/${encodeURIComponent(required('--change'))}`);
+  } else if (group === 'checkpoint' && action === 'list') {
+    result = await request(`/api/v1/changes/${encodeURIComponent(required('--change'))}/checkpoints`);
+  } else if (group === 'receipt' && action === 'show') {
+    result = await request(`/api/v1/receipts/${encodeURIComponent(required('--request-id'))}`);
+  } else if (group === 'checkpoint' && action === 'save') {
+    const grant = await readGrant();
+    let input: string;
+    try {
+      if (flags.has('--pending-file')) {
+        pendingInputFile = resolve(required('--pending-file'));
+        input = await decodeSecret(await boundedInput(createReadStream(pendingInputFile), 4 * 1024 * 1024));
+      }
+      else input = await boundedInput(stdin ? process.stdin : createReadStream(resolve(required('--file'))));
+      if (Buffer.byteLength(input, 'utf8') > 1024 * 1024) throw new InputTooLarge();
+    } catch (error) {
+      if (error instanceof InputTooLarge || error instanceof TypeError) throw new CliError('INPUT_ERROR', '正文超过 1 MiB 或不是有效 UTF-8。', 2);
+      throw new CliError('INPUT_ERROR', '无法读取保存点正文。', 6);
+    }
+    if (stdin) {
+      try {
+        const staging = join(dataDir, 'staging');
+        await mkdir(staging, { recursive: true, mode: 0o700 });
+        const temporaryInput = join(staging, `checkpoint-input-${randomUUID()}.enc`);
+        await writeFile(temporaryInput, await encodeSecret(input), { flag: 'wx', mode: 0o600 });
+        pendingInputFile = temporaryInput;
+      } catch { throw new CliError('INPUT_ERROR', '无法保护标准输入正文，尚未提交。', 6); }
+    }
+    let content: unknown;
+    try { content = JSON.parse(input) as unknown; } catch { throw new CliError('INVALID_ARGUMENT', '保存点正文不是有效 JSON。', 2); }
+    if (!content || typeof content !== 'object' || Array.isArray(content)) throw new CliError('INVALID_ARGUMENT', '保存点正文必须是 JSON 对象。', 2);
+    if ('observationId' in content) throw new CliError('INVALID_ARGUMENT', '正文不能包含 observationId，请通过 --observation 指定。', 2);
+    result = await request(`/api/v1/changes/${encodeURIComponent(required('--change'))}/checkpoints`, { requestId: required('--request-id'), expectedVersion: number('--version'), writerSessionId: grant.sessionId, generation: grant.generation, payload: { ...content, observationId: required('--observation') } }, grant.writerToken);
+  } else if (group === 'session' && action === 'start') {
+    const changeId = required('--change');
+    const requestId = required('--request-id');
+    const grantFile = resolve(required('--grant-file'));
+    const body = { requestId, expectedVersion: number('--version'), payload: { workspaceId: required('--workspace'), expectedBindingVersion: number('--binding-version'), toolLabel: required('--tool') } };
+    let existing: Grant | undefined;
+    try { existing = JSON.parse(await decodeSecret(await readFile(grantFile, 'utf8'))) as Grant; }
+    catch (error) { if (!(typeof error === 'object' && error !== null && 'code' in error && error.code === 'ENOENT')) throw new CliError('GRANT_FILE_ERROR', '无法读取已有授权文件。', 6); }
+    if (existing && (existing.requestId !== requestId || !/^[0-9a-f]{64}$/.test(existing.writerToken))) throw new CliError('GRANT_FILE_EXISTS', '授权文件已存在或无效，请使用新的文件路径。', 2);
+    if (!existing) {
+      existing = { requestId, writerToken: randomBytes(32).toString('hex') };
+      try { await writeFile(grantFile, await encodeSecret(JSON.stringify(existing)), { flag: 'wx', mode: 0o600 }); }
+      catch { throw new CliError('GRANT_FILE_ERROR', '无法创建授权文件，尚未申请会话。', 6); }
+    }
+    const response = await request(`/api/v1/changes/${encodeURIComponent(changeId)}/writer-sessions`, body, existing.writerToken);
+    if (typeof response.requestId !== 'string' || typeof response.resourceId !== 'string' || typeof response.recordVersion !== 'number' || typeof response.committedAt !== 'string' || typeof response.generation !== 'number' || typeof response.active !== 'boolean') throw new CliError('INVALID_RESPONSE', '服务响应缺少回执；请使用原请求标识和授权文件重试。', 6);
+    if (!response.active) throw new CliError('SESSION_EXPIRED', '会话已失效，不能重新使用原授权。', 3);
+    if ((existing.sessionId && existing.sessionId !== response.resourceId) || (existing.generation && existing.generation !== response.generation)) throw new CliError('GRANT_FILE_EXISTS', '授权文件内容不匹配，请检查原请求。', 2);
+    const grant: Grant = { requestId, sessionId: response.resourceId, generation: response.generation, writerToken: existing.writerToken };
+    const temporary = `${grantFile}.${randomUUID()}.tmp`;
+    try { await writeFile(temporary, await encodeSecret(JSON.stringify(grant)), { flag: 'wx', mode: 0o600 }); await rename(temporary, grantFile); }
+    catch { await rm(temporary, { force: true }).catch(() => {}); throw new CliError('GRANT_FILE_ERROR', '会话可能已创建，请用原请求标识和授权文件重试。', 6); }
+    result = { ...response, grantFile };
+  } else if (group === 'session' && action === 'release') {
+    const grant = await readGrant();
+    result = await request(`/api/v1/writer-sessions/${encodeURIComponent(grant.sessionId)}/release`, { requestId: required('--request-id'), expectedVersion: number('--version'), generation: grant.generation }, grant.writerToken);
+  } else throw new CliError('INVALID_ARGUMENT', '命令无效。', 2);
+  if ((group === 'session' && action === 'release') || (group === 'workspace' && action === 'observe') || (group === 'checkpoint' && action === 'save')) {
+    if (typeof result.requestId !== 'string' || typeof result.resourceId !== 'string' || typeof result.recordVersion !== 'number' || typeof result.committedAt !== 'string') throw new CliError('INVALID_RESPONSE', '服务响应缺少回执；写入结果可能未知，请使用原请求标识重试。', 6);
+  }
+  if (pendingInputFile && stdin) {
+    try { await rm(pendingInputFile); pendingInputFile = undefined; }
+    catch { /* retained encrypted input is still usable if cleanup fails */ }
+  }
+  if (pendingInputFile) result = { ...result, retainedInputFile: pendingInputFile };
+  process.stdout.write(`${json ? JSON.stringify(result) : JSON.stringify(result, null, 2)}\n`);
+}
+
+main().catch((error: unknown) => {
+  const failure = error instanceof CliError ? error : new CliError('SERVICE_UNAVAILABLE', '本机服务或文件不可用。', 6);
+  process.stderr.write(`${JSON.stringify({ code: failure.code, message: failure.message, ...failure.details, ...(pendingInputFile ? { pendingInputFile } : {}) })}\n`);
+  process.exitCode = failure.exitCode;
+});

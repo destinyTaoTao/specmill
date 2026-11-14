@@ -3,12 +3,40 @@
   "version": "0.0.1",
   "private": true,
   "type": "module",
-  "engines": { "node": ">=24 <25" },
-  "scripts": {
-    "dev": "vite --host 127.0.0.1",
-    "build": "tsc --noEmit && vite build",
-    "typecheck": "tsc --noEmit"
+  "engines": {
+    "node": ">=24.22.3 <25"
   },
-  "dependencies": { "react": "^19.0.0", "react-dom": "^19.0.0" },
-  "devDependencies": { "@types/node": "^24.0.0", "@types/react": "^19.0.0", "@types/react-dom": "^19.0.0", "@vitejs/plugin-react": "^5.0.0", "typescript": "^5.9.0", "vite": "^7.0.0" }
+  "scripts": {
+    "dev": "npm run build && npm run start",
+    "start": "node dist-server/server/main.js",
+    "cli": "node dist-cli/cli/main.js",
+    "build": "tsc --noEmit && tsc -p tsconfig.server.json && tsc -p tsconfig.cli.json && vite build",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint .",
+    "test": "vitest run",
+    "test:e2e": "playwright test"
+  },
+  "dependencies": {
+    "@fastify/static": "10.1.11",
+    "better-sqlite3": "12.11.1",
+    "fastify": "5.12.8",
+    "proper-lockfile": "4.1.2",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.65.1",
+    "@types/better-sqlite3": "7.6.13",
+    "@types/node": "^24.0.0",
+    "@types/proper-lockfile": "4.1.4",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "^5.0.0",
+    "eslint": "10.15.0",
+    "tsx": "4.23.15",
+    "typescript": "^5.9.0",
+    "typescript-eslint": "8.72.2",
+    "vite": "^7.0.0",
+    "vitest": "5.1.0"
+  }
 }

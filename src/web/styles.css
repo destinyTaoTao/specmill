@@ -1,0 +1,7 @@
+:root { font-family: system-ui, sans-serif; color: #162236; background: #f4f6f9; }
+main { max-width: 44rem; margin: 4rem auto; padding: 2rem; background: white; border-radius: .75rem; }
+form { display: grid; gap: .8rem; margin: 1.5rem 0; }
+label { display: grid; gap: .4rem; }
+input, button { font: inherit; padding: .65rem; }
+button { width: fit-content; cursor: pointer; }
+[role=alert] { color: #a01c1c; }
