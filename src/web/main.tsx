@@ -151,12 +151,24 @@ function App() {
   const [projects, setProjects] = useState<Project[] | null>(null);
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
+  const [restoring, setRestoring] = useState(false);
+  const [restoreNotice, setRestoreNotice] = useState('');
   const [selectedProject, setSelectedProject] = useState<Project | null>(null);
   const requestId = useRef(crypto.randomUUID());
+  const restoreId = useRef(crypto.randomUUID());
   async function load() {
     const response = await fetch('/api/v1/projects');
     if (!response.ok) throw await responseError(response, '读取项目失败，请检查服务状态。');
     setProjects((await response.json()).projects);
+  }
+  async function restorePackage(file: File) {
+    setRestoring(true); setError(''); setRestoreNotice('');
+    try {
+      const result = await readJson<{ restoredProjectId: string; sourceBindingRequired: boolean }>(await fetch(`/api/v1/restore?requestId=${encodeURIComponent(restoreId.current)}`, { method: 'POST', headers: { 'Content-Type': 'application/octet-stream', 'X-SpecMill-Request': '1' }, body: file }), '恢复失败。');
+      restoreId.current = crypto.randomUUID();
+      try { await load(); } catch { /* 列表刷新失败不否定恢复结果 */ }
+      setRestoreNotice(`项目记录与附件已恢复（${result.restoredProjectId.slice(0, 8)}…）。源码目录未随包恢复：${result.sourceBindingRequired ? '请打开项目重新绑定工作目录后再续做；恢复成功不代表源码已备份。' : ''}`);
+    } catch (err) { setError(err instanceof ApiError ? err.message : '恢复结果未知，请稍后查看项目列表。'); } finally { setRestoring(false); }
   }
   async function login(event: FormEvent) {
     event.preventDefault(); setBusy(true); setError('');
@@ -184,7 +196,9 @@ function App() {
     {projects === null ? <form onSubmit={login}><label>本次登录口令<input disabled={busy} type="password" value={token} onChange={e => setToken(e.target.value)} required /></label><p>口令显示在启动服务的终端中。</p><button disabled={busy}>登录</button></form>
       : selectedProject ? <ProjectDetails project={selectedProject} onBack={() => setSelectedProject(null)} />
       : <><h2>项目</h2><form onSubmit={create}><label>项目名称<input disabled={busy} value={name} maxLength={200} onChange={e => { setName(e.target.value); requestId.current = crypto.randomUUID(); }} required /></label><button disabled={busy}>创建项目</button></form>
-        {projects.length === 0 ? <p>尚无项目，请先创建。</p> : <ul>{projects.map(project => <li key={project.id}><span>{project.name}</span> <button onClick={() => setSelectedProject(project)}>打开 {project.name}</button></li>)}</ul>}</>}
+        <label>从恢复包恢复（.zip，仅恢复记录与附件，不含源码）<input type="file" accept=".zip" disabled={busy || restoring} onChange={event => { const file = event.target.files?.[0]; event.target.value = ''; if (file) void restorePackage(file); }} /></label>
+        {restoreNotice && <p>{restoreNotice}</p>}
+        {projects.length === 0 ? <p>尚无项目，请先创建或从恢复包恢复。</p> : <ul>{projects.map(project => <li key={project.id}><span>{project.name}</span> <button onClick={() => setSelectedProject(project)}>打开 {project.name}</button></li>)}</ul>}</>}
   </main>;
 }
 createRoot(document.getElementById('root')!).render(<App />);

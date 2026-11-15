@@ -41,6 +41,31 @@ async function setup(port = 43218, maxProjectRecordsBytes?: number, tag = 'defau
   return { app, dataDir, repoDir, projectId, workspaceId, changeId, ownerHeaders, git };
 }
 
+// 最小 STORE ZIP 读取器：解析中央目录并按名称取内容，供测试核对包结构。
+function readZipEntries(zip: Buffer): Map<string, Buffer> {
+  let eocdOffset = -1;
+  for (let index = zip.length - 22; index >= 0; index--) {
+    if (zip.readUInt32LE(index) === 0x06054b50) { eocdOffset = index; break; }
+  }
+  if (eocdOffset < 0) throw new Error('EOCD not found');
+  const entryCount = zip.readUInt16LE(eocdOffset + 10);
+  const centralOffset = zip.readUInt32LE(eocdOffset + 16);
+  const entries = new Map<string, Buffer>();
+  let cursor = centralOffset;
+  for (let index = 0; index < entryCount; index++) {
+    if (zip.readUInt32LE(cursor) !== 0x02014b50) throw new Error('bad central entry');
+    const nameLength = zip.readUInt16LE(cursor + 28);
+    const localOffset = zip.readUInt32LE(cursor + 42);
+    const name = zip.slice(cursor + 46, cursor + 46 + nameLength).toString('utf8');
+    const localNameLength = zip.readUInt16LE(localOffset + 26);
+    const dataStart = localOffset + 30 + localNameLength;
+    const compressedSize = zip.readUInt32LE(localOffset + 18);
+    entries.set(name, zip.slice(dataStart, dataStart + compressedSize));
+    cursor += 46 + nameLength;
+  }
+  return entries;
+}
+
 describe('restore from recovery package', () => {
   it('round-trips a full export into an isolated data directory with identical records', async () => {
     const source = await setup(43218, undefined, 'src1');
@@ -93,6 +118,24 @@ describe('restore from recovery package', () => {
     const session = await restoredApp.inject({ method: 'POST', url: `/api/v1/changes/${source.changeId}/writer-sessions`, headers: { ...agentHeaders, host: '127.0.0.1:43219', 'x-specmill-writer-token': 'a'.repeat(64) },
       payload: { requestId: 'restore-start-ok', expectedVersion: restoredChange.version, payload: { workspaceId: source.workspaceId, expectedBindingVersion: 2, toolLabel: '恢复后工具' } } });
     expect(session.statusCode).toBe(201);
+    // 实际续做：重新观察 → 保存点 → 释放；恢复实例上形成新记录
+    const observe = await restoredApp.inject({ method: 'POST', url: `/api/v1/workspaces/${source.workspaceId}/observations`, headers: { ...agentHeaders, host: '127.0.0.1:43219', 'x-specmill-writer-token': 'a'.repeat(64) },
+      payload: { requestId: 'restore-observe', expectedBindingVersion: 2, selectedUntracked: [], writerSessionId: session.json().resourceId, generation: session.json().generation } });
+    expect(observe.statusCode).toBe(201);
+    const observationId = observe.json().resourceId as string;
+    const checkpoint = await restoredApp.inject({ method: 'POST', url: `/api/v1/changes/${source.changeId}/checkpoints`, headers: { ...agentHeaders, host: '127.0.0.1:43219', 'x-specmill-writer-token': 'a'.repeat(64) },
+      payload: { requestId: 'restore-checkpoint', expectedVersion: restoredChange.version + 1, writerSessionId: session.json().resourceId, generation: session.json().generation, payload: { observationId, done: '恢复后继续开发', failures: '无', unverified: '恢复往返未验证', blockers: '无', nextSteps: '继续正常开发' } } });
+    expect(checkpoint.statusCode).toBe(201);
+    const release = await restoredApp.inject({ method: 'POST', url: `/api/v1/writer-sessions/${session.json().resourceId}/release`, headers: { ...agentHeaders, host: '127.0.0.1:43219', 'x-specmill-writer-token': 'a'.repeat(64) },
+      payload: { requestId: 'restore-release', expectedVersion: restoredChange.version + 2, generation: session.json().generation } });
+    expect(release.statusCode).toBe(200);
+    // 恢复实例再次完整导出：新保存点进入包中
+    const reExport = await restoredApp.inject({ method: 'POST', url: `/api/v1/projects/${source.projectId}/exports`, headers: { ...agentHeaders, host: '127.0.0.1:43219' }, payload: { requestId: 'restore-re-export' } });
+    expect(reExport.statusCode).toBe(201);
+    await restoredApp.inject({ url: `/api/v1/exports/${reExport.json().resourceId}`, headers: { host: '127.0.0.1:43219', origin: 'http://127.0.0.1:43219', cookie: restoreHeaders.cookie } });
+    const reZip = (await restoredApp.inject({ url: `/api/v1/exports/${reExport.json().resourceId}/download`, headers: { host: '127.0.0.1:43219', origin: 'http://127.0.0.1:43219', cookie: restoreHeaders.cookie } })).rawPayload!;
+    const reRecords = JSON.parse(readZipEntries(reZip).get('records.json')!.toString('utf8')) as { checkpoints: { id: string }[] };
+    expect(reRecords.checkpoints.some(item => item.id === checkpoint.json().resourceId)).toBe(true);
   }, 60000);
 
   it('rejects tampered packages, unknown formats and schema mismatches before activation', async () => {
