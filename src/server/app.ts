@@ -14,6 +14,7 @@ import { registerHandoffs } from './features/handoffs.js';
 import { registerEvidence } from './features/evidence.js';
 import { registerReview } from './features/review.js';
 import { registerRecovery } from './features/recovery.js';
+import { registerProjectOverviews } from './features/project-overviews.js';
 import { checkProjectCapacity, DEFAULT_RECORDS_LIMIT, ProjectCapacityExceeded } from './storage/project-capacity.js';
 import { requestIdUsedElsewhere } from './storage/request-ids.js';
 
@@ -44,7 +45,7 @@ export async function buildApp(options: AppOptions) {
     const version = (db.prepare('select sqlite_version() as version').get() as {version: string}).version.split('.').map(Number);
     if (version[0] < 3 || (version[0] === 3 && (version[1] < 51 || (version[1] === 51 && version[2] < 3)))) throw new Error('SQLite 3.51.3 or later required');
     const schemaVersion = db.pragma('user_version', { simple: true }) as number;
-    if (schemaVersion > 16) throw new Error('Unsupported database schema');
+    if (schemaVersion > 18) throw new Error('Unsupported database schema');
     db.pragma('journal_mode = WAL'); db.pragma('locking_mode = EXCLUSIVE'); db.pragma('foreign_keys = ON'); db.pragma('synchronous = FULL'); db.pragma('busy_timeout = 5000');
     db.exec('BEGIN EXCLUSIVE; COMMIT');
     if (schemaVersion === 0) db.transaction(() => {
@@ -250,6 +251,31 @@ export async function buildApp(options: AppOptions) {
         db!.exec('ALTER TABLE export_operations ADD COLUMN deadline_at TEXT; PRAGMA user_version = 16');
       })();
     }
+    if (schemaVersion < 17) {
+      if (schemaVersion === 16) {
+        const backupDir = join(dir, 'backups');
+        await mkdir(backupDir, { recursive: true });
+        await db.backup(join(backupDir, `before-schema-17-${randomUUID()}.db`));
+      }
+      db.transaction(() => {
+        db!.exec(`ALTER TABLE acceptance_targets ADD COLUMN confirmation_order INTEGER CHECK (confirmation_order IS NULL OR confirmation_order > 0);
+          CREATE UNIQUE INDEX target_confirmation_order ON acceptance_targets(change_id, confirmation_order) WHERE confirmation_order IS NOT NULL;
+          UPDATE acceptance_targets SET confirmation_order = 1 WHERE status = 'confirmed' AND change_id IN (SELECT change_id FROM acceptance_targets WHERE status = 'confirmed' GROUP BY change_id HAVING COUNT(*) = 1);
+          PRAGMA user_version = 17`);
+      })();
+    }
+    if (schemaVersion < 18) {
+      if (schemaVersion === 17) {
+        const backupDir = join(dir, 'backups');
+        await mkdir(backupDir, { recursive: true });
+        await db.backup(join(backupDir, `before-schema-18-${randomUUID()}.db`));
+      }
+      db.transaction(() => {
+        db!.exec(`ALTER TABLE failure_dispositions ADD COLUMN target_id TEXT REFERENCES acceptance_targets(id);
+          CREATE TABLE restore_receipts (request_id TEXT PRIMARY KEY, package_sha256 TEXT NOT NULL, project_id TEXT NOT NULL REFERENCES projects(id), counts_json TEXT NOT NULL, committed_at TEXT NOT NULL);
+          PRAGMA user_version = 18`);
+      })();
+    }
     db.transaction(() => {
       db!.exec("UPDATE changes SET version = version + 1 WHERE id IN (SELECT change_id FROM writer_sessions WHERE status = 'active')");
       db!.prepare("UPDATE writer_sessions SET status = 'interrupted', ended_at = ? WHERE status = 'active'").run(new Date().toISOString());
@@ -293,6 +319,7 @@ export async function buildApp(options: AppOptions) {
       return reply.header('Set-Cookie', `specmill_session=${id}; HttpOnly; SameSite=Strict; Path=/`).send({ ok: true });
     });
     app.get('/api/v1/projects', async () => ({ projects: db!.prepare('SELECT id, name, created_at as createdAt FROM projects ORDER BY created_at, id').all() }));
+    registerProjectOverviews(app, db);
     app.post<{Body: {name: string; requestId: string}}>('/api/v1/projects', { schema: { body: { type: 'object', required: ['name', 'requestId'], additionalProperties: false, properties: { name: { type: 'string', minLength: 1, maxLength: 200 }, requestId: { type: 'string', minLength: 1, maxLength: 128 } } } } }, async (request, reply) => {
       const name = request.body.name.trim();
       if (!name) return sendError(request, reply, 400, 'INVALID_NAME', '项目名称不能为空。');
@@ -322,9 +349,9 @@ export async function buildApp(options: AppOptions) {
     registerChanges(app, db, recordsLimit);
     registerBaselines(app, db, recordsLimit);
     registerCheckpoints(app, db, recordsLimit, isOwner, authorizeWriter);
-    registerHandoffs(app, db, recordsLimit);
-    registerEvidence(app, db, recordsLimit, join(dir, 'attachments'));
-    registerReview(app, db, recordsLimit, join(dir, 'attachments'));
+    registerHandoffs(app, db, recordsLimit, isOwner, authorizeWriter);
+    registerEvidence(app, db, recordsLimit, join(dir, 'attachments'), isOwner, authorizeWriter);
+    registerReview(app, db, recordsLimit, join(dir, 'attachments'), isOwner, authorizeWriter);
     registerRecovery(app, db, dir, recordsLimit, isOwner);
     app.setErrorHandler((error, request, reply) => {
       if (error instanceof ProjectCapacityExceeded) return reply.code(413).send({ code: error.code, message: error.message, requestId: request.id, dimension: error.dimension, used: error.used, requestedIncrement: error.requestedIncrement, limit: error.limit });

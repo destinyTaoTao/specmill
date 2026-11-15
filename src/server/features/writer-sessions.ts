@@ -74,7 +74,7 @@ export function registerWriterSessions(app: FastifyInstance, db: Database.Databa
       const change = db.prepare('SELECT project_id AS projectId, version, phase FROM changes WHERE id = ?').get(changeId) as { projectId: string; version: number; phase: string } | undefined;
       if (!change) return 'NOT_FOUND';
       if (change.version !== expectedVersion) return { currentVersion: change.version };
-      if (change.phase !== 'Draft' && change.phase !== 'Working') return 'INVALID_STATE';
+      if (change.phase !== 'Draft' && change.phase !== 'Working' && change.phase !== 'Reviewing') return 'INVALID_STATE';
       const current = db.prepare('SELECT w.project_id AS projectId, w.version, w.common_key AS commonKey, p.common_key AS projectCommonKey FROM workspaces w JOIN project_repositories p ON p.project_id = w.project_id WHERE w.id = ?').get(workspace.id) as { projectId: string; version: number; commonKey: string; projectCommonKey: string } | undefined;
       if (!current || current.projectId !== change.projectId || current.version !== payload.expectedBindingVersion || current.commonKey !== current.projectCommonKey) return 'WORKSPACE_CHANGED';
       if (db.prepare("SELECT 1 FROM writer_sessions WHERE status = 'active' AND (change_id = ? OR workspace_id = ?)").get(changeId, workspace.id)) return 'WRITER_IN_USE';
@@ -150,7 +150,7 @@ export function registerWriterSessions(app: FastifyInstance, db: Database.Databa
       const change = db.prepare('SELECT project_id AS projectId, version, phase, current_checkpoint_id AS checkpointId FROM changes WHERE id = ?').get(changeId) as { projectId: string; version: number; phase: string; checkpointId: string | null } | undefined;
       if (!change) return 'NOT_FOUND';
       if (change.version !== expectedVersion) return { currentVersion: change.version };
-      if (change.phase !== 'Draft' && change.phase !== 'Working') return 'SESSION_EXPIRED';
+      if (change.phase !== 'Draft' && change.phase !== 'Working' && change.phase !== 'Reviewing') return 'SESSION_EXPIRED';
       if (change.checkpointId !== payload.expectedCheckpointId) return 'CHECKPOINT_CHANGED';
       const old = getSession(payload.writerSessionId);
       if (!old || old.changeId !== changeId || old.status !== 'active' || old.generation !== payload.expectedGeneration) return 'SESSION_EXPIRED';

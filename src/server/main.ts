@@ -25,7 +25,7 @@ const app = await buildApp({ dataDir, port, ownerToken, agentToken, webDir: join
 try {
   const temporary = join(dataDir, `cli-token-${randomUUID()}.tmp`);
   try {
-    await writeFile(temporary, await encodeSecret(agentToken), { flag: 'wx', mode: 0o600 });
+    await writeFile(temporary, await encodeSecret(JSON.stringify({ format: 'specmill-cli-1', port, token: agentToken })), { flag: 'wx', mode: 0o600 });
     await rename(temporary, join(dataDir, 'cli-token'));
   } finally { await rm(temporary, { force: true }); }
   await app.listen({ host: '127.0.0.1', port });

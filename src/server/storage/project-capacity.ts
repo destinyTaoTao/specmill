@@ -1,6 +1,8 @@
 import type Database from 'better-sqlite3';
 
 export const DEFAULT_RECORDS_LIMIT = 20 * 1024 * 1024;
+// Two ZIP entries are reserved for manifest.json and records.json.
+export const MAX_PROJECT_ATTACHMENTS = 9998;
 
 // Keep the serialized record projection shared with the future recovery exporter.
 export function projectRecords(db: Database.Database, projectId: string) {
@@ -10,9 +12,11 @@ export function projectRecords(db: Database.Database, projectId: string) {
     project,
     projectRequests: db.prepare('SELECT * FROM requests WHERE project_id = ? ORDER BY request_id').all(projectId),
     repository: db.prepare('SELECT * FROM project_repositories WHERE project_id = ?').get(projectId) ?? null,
-    workspaces: db.prepare('SELECT * FROM workspaces WHERE project_id = ? ORDER BY id').all(projectId),
+    // Target creation selects a workspace by insertion order; retain it on restore.
+    workspaces: db.prepare('SELECT * FROM workspaces WHERE project_id = ? ORDER BY rowid').all(projectId),
     workspaceRequests: db.prepare('SELECT r.* FROM workspace_requests r JOIN workspaces w ON w.id = r.resource_id WHERE w.project_id = ? ORDER BY r.request_id').all(projectId),
-    observations: db.prepare('SELECT * FROM workspace_observations WHERE project_id = ? ORDER BY id').all(projectId),
+    // Observation lists use insertion order; preserve it across export and restore.
+    observations: db.prepare('SELECT * FROM workspace_observations WHERE project_id = ? ORDER BY rowid').all(projectId),
     observationRequests: db.prepare('SELECT r.* FROM observation_requests r JOIN workspace_observations o ON o.id = r.observation_id WHERE o.project_id = ? ORDER BY r.request_id').all(projectId),
     changes: db.prepare('SELECT * FROM changes WHERE project_id = ? ORDER BY id').all(projectId),
     changeRevisions: db.prepare('SELECT r.* FROM change_revisions r JOIN changes c ON c.id = r.change_id WHERE c.project_id = ? ORDER BY r.id').all(projectId),
@@ -39,7 +43,7 @@ export function projectRecords(db: Database.Database, projectId: string) {
     reviewPreviews: db.prepare('SELECT p.* FROM review_previews p WHERE p.project_id = ? ORDER BY p.id').all(projectId),
     decisions: db.prepare('SELECT d.* FROM decisions d WHERE d.project_id = ? ORDER BY d.id').all(projectId),
     failureDispositions: db.prepare('SELECT f.* FROM failure_dispositions f WHERE f.project_id = ? ORDER BY f.id').all(projectId),
-    reviewRequests: db.prepare('SELECT r.* FROM review_requests r WHERE r.resource_id IN (SELECT id FROM review_previews WHERE project_id = ?) OR r.resource_id IN (SELECT id FROM decisions WHERE project_id = ?) OR r.resource_id IN (SELECT id FROM failure_dispositions WHERE project_id = ?) OR r.resource_id IN (SELECT id FROM changes WHERE project_id = ?)').all(projectId, projectId, projectId, projectId),
+    reviewRequests: db.prepare('SELECT r.* FROM review_requests r WHERE r.resource_id IN (SELECT id FROM review_previews WHERE project_id = ?) OR r.resource_id IN (SELECT id FROM decisions WHERE project_id = ?) OR r.resource_id IN (SELECT id FROM failure_dispositions WHERE project_id = ?) OR r.resource_id IN (SELECT id FROM changes WHERE project_id = ?) ORDER BY r.request_id').all(projectId, projectId, projectId, projectId),
   };
 }
 

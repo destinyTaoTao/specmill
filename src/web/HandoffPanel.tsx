@@ -46,7 +46,7 @@ export function HandoffPanel({ change, workspaces }: { change: Change; workspace
       setContinuation(await readJson<Continuation>(await fetch(`/api/v1/changes/${change.id}/continuation/${encodeURIComponent(workspaceId)}`), '续做核对失败。'));
     } catch (err) { setError(err instanceof ApiError ? err.message : '续做核对失败，可重试。'); } finally { setBusy(false); }
   }
-  return <section><h5>交接与续做</h5>{error && <p role="alert">{error}</p>}{notice && <p>{notice}</p>}
+  return <section><h5>交接与续做</h5>{error && <p role="alert">{error}</p>}<p role="status">{notice}</p>
     <button disabled={busy} onClick={() => { void create(); }}>生成固定交接</button>
     {snapshots === null ? <p>正在读取交接快照。</p> : snapshots.length === 0 ? <p>尚无交接快照。</p> : <ul>{snapshots.map(item => <li key={item.id}>快照 {item.id} · 捕获版本 {item.capturedVersion} · {item.createdAt} · <button disabled={busy} onClick={() => { void renderSnapshot(item.id); }}>读取固定交接</button></li>)}</ul>}
     {rendered && <div><p>快照 {rendered.id} 的固定材料：</p><pre aria-label="固定交接材料" style={{ whiteSpace: 'pre-wrap' }}>{rendered.markdown}</pre></div>}

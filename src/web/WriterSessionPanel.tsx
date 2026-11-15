@@ -7,6 +7,8 @@ type Session = { id: string; workspaceId: string; bindingVersion: number; toolLa
 type Change = { id: string; version: number; phase: string };
 type Checkpoint = { id: string; createdAt: string; goal: string; done: string; failures: string; unverified: string; blockers: string; nextSteps: string };
 type TakeoverPreview = { sessionId: string; generation: number; version: number; checkpoint: Checkpoint | null };
+const READ_SESSION_ERROR = '读取写会话失败，请重试。';
+const REFRESH_SESSION_ERROR = '刷新写会话失败，请重试。';
 
 export function WriterSessionPanel({ change, workspaces, refresh }: { change: Change; workspaces: Workspace[]; refresh: () => Promise<void> }) {
   const [sessions, setSessions] = useState<Session[] | null>(null);
@@ -29,15 +31,15 @@ export function WriterSessionPanel({ change, workspaces, refresh }: { change: Ch
     let live = true;
     setLoading(true);
     void fetch(`/api/v1/changes/${change.id}/writer-sessions`).then(response => readJson<{ sessions: Session[] }>(response, '读取写会话失败。'))
-      .then(result => { if (live) { setSessions(result.sessions); setLoadedVersion(change.version); } })
-      .catch(() => { if (live) { setLoadedVersion(null); setError('读取写会话失败，请重试。'); } })
+      .then(result => { if (live) { setSessions(result.sessions); setLoadedVersion(change.version); setError(current => current === READ_SESSION_ERROR || current === REFRESH_SESSION_ERROR ? '' : current); } })
+      .catch(() => { if (live) { setLoadedVersion(null); setError(READ_SESSION_ERROR); } })
       .finally(() => { if (live) setLoading(false); });
     return () => { live = false; };
   }, [change.id, change.version, sequence]);
   async function refreshStatus() {
     setLoading(true);
     try { await refresh(); setSequence(value => value + 1); }
-    catch { setLoadedVersion(null); setLoading(false); setError('刷新写会话失败，请重试。'); }
+    catch { setLoadedVersion(null); setLoading(false); setError(REFRESH_SESSION_ERROR); }
   }
   async function submit(action: 'start' | 'release') {
     setBusy(true); setError('');

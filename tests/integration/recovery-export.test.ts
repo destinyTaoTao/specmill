@@ -1,11 +1,17 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import Database from 'better-sqlite3';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, open, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { buildApp } from '../../src/server/app.js';
+import { projectRecords } from '../../src/server/storage/project-capacity.js';
+
+vi.mock('node:fs/promises', async importOriginal => {
+  const actual = await importOriginal<typeof import('node:fs/promises')>();
+  return { ...actual, readFile: vi.fn(actual.readFile), open: vi.fn(actual.open) };
+});
 
 const dirs: string[] = [];
 const apps: Awaited<ReturnType<typeof buildApp>>[] = [];
@@ -43,7 +49,9 @@ async function setup(maxProjectRecordsBytes?: number, port = 43222) {
   return { app, dataDir, repoDir, projectId, workspaceId, changeId, ownerHeaders };
 }
 async function uploadAttachment(app: Awaited<ReturnType<typeof buildApp>>, projectId: string, requestId: string, content: Buffer, filename = 'evidence.log') {
-  const upload = await app.inject({ method: 'POST', url: `/api/v1/projects/${projectId}/attachments?requestId=${requestId}&filename=${encodeURIComponent(filename)}`, headers: { ...agentHeaders, 'content-type': 'application/octet-stream' }, payload: content });
+  const login = await app.inject({ method: 'POST', url: '/api/v1/session', headers, payload: { token: 'owner-token' } });
+  const owner = { ...headers, cookie: login.headers['set-cookie'] as string, 'x-specmill-request': '1', 'content-type': 'application/octet-stream' };
+  const upload = await app.inject({ method: 'POST', url: `/api/v1/projects/${projectId}/attachments?requestId=${requestId}&filename=${encodeURIComponent(filename)}`, headers: owner, payload: content });
   expect(upload.statusCode).toBe(201);
   return upload.json().resourceId as string;
 }
@@ -73,6 +81,162 @@ function readZipEntries(zip: Buffer): Map<string, Buffer> {
 }
 
 describe('project recovery export', () => {
+  it('serializes the same review receipts regardless of their insertion order', async () => {
+    const { app, dataDir, projectId, changeId } = await setup();
+    await app.close(); apps.splice(apps.indexOf(app), 1);
+    const db = new Database(join(dataDir, 'specmill.db'));
+    try {
+      const insert = db.prepare('INSERT INTO review_requests(request_id,fingerprint,resource_id,action,record_version,committed_at) VALUES (?,?,?,?,?,?)');
+      const fingerprint = JSON.stringify(['review-continue', changeId, 1]);
+      const put = (ids: string[]) => db.transaction(() => {
+        for (const id of ids) insert.run(id, fingerprint, changeId, 'continue', 2, '2026-11-15T00:00:00.000Z');
+      })();
+      put(['z-review', 'a-review']);
+      const first = JSON.stringify(projectRecords(db, projectId));
+      db.prepare('DELETE FROM review_requests WHERE request_id IN (?, ?)').run('z-review', 'a-review');
+      put(['a-review', 'z-review']);
+      const second = JSON.stringify(projectRecords(db, projectId));
+      expect(second).toBe(first);
+    } finally { db.close(); }
+  }, 30000);
+  it('fails without publishing a package larger than the restore request limit', async () => {
+    const { app, dataDir, projectId, ownerHeaders } = await setup(80 * 1024 * 1024);
+    for (let index = 0; index < 13; index++) {
+      await uploadAttachment(app, projectId, `large-${index}`, Buffer.alloc(5 * 1024 * 1024, index));
+    }
+    const start = await app.inject({ method: 'POST', url: `/api/v1/projects/${projectId}/exports`, headers: agentHeaders, payload: { requestId: 'large-export' } });
+    const id = start.json().resourceId as string;
+    const status = (await app.inject({ url: `/api/v1/exports/${id}`, headers: ownerHeaders })).json();
+    expect(status.status).toBe('failed');
+    expect(status.error).toContain('恢复包超过 64 MiB');
+    expect(status.sha256).toBeNull();
+    expect((await app.inject({ url: `/api/v1/exports/${id}/download`, headers: ownerHeaders })).statusCode).toBe(409);
+    await expect(stat(join(dataDir, 'exports', `${id}.zip`))).rejects.toMatchObject({ code: 'ENOENT' });
+  }, 120000);
+  it('rejects a legacy project above the ZIP entry limit before reading attachment files', async () => {
+    const { app, dataDir, projectId } = await setup();
+    await app.close(); apps.splice(apps.indexOf(app), 1);
+    const db = new Database(join(dataDir, 'specmill.db'));
+    try {
+      const insert = db.prepare('INSERT INTO attachments(id,project_id,sha256,size,filename,content_type,created_at) VALUES (?,?,?,?,?,?,?)');
+      db.transaction(() => {
+        for (let index = 0; index < 65534; index++) insert.run(`legacy-${index}`, projectId, createHash('sha256').update(`legacy-${index}`).digest('hex'), 1, 'x', 'text/plain', '2026-01-01T00:00:00Z');
+      })();
+    } finally { db.close(); }
+    const restarted = await buildApp({ dataDir, port: 43222, ownerToken: 'owner-token', agentToken: 'agent-token' }); apps.push(restarted);
+    const login = await restarted.inject({ method: 'POST', url: '/api/v1/session', headers, payload: { token: 'owner-token' } });
+    const owner = { ...headers, cookie: login.headers['set-cookie'] as string, 'x-specmill-request': '1' };
+    const start = await restarted.inject({ method: 'POST', url: `/api/v1/projects/${projectId}/exports`, headers: agentHeaders, payload: { requestId: 'legacy-overflow' } });
+    const id = start.json().resourceId as string;
+    vi.mocked(readFile).mockClear();
+    vi.mocked(readFile).mockImplementation(async () => { throw new Error('unexpected attachment read'); });
+    try {
+      const status = await restarted.inject({ url: `/api/v1/exports/${id}`, headers: owner });
+      expect(status.json().status).toBe('failed');
+      expect(String(status.json().error).slice(0, 120)).toContain('ZIP 文件项超过格式上限');
+      expect(vi.mocked(readFile)).not.toHaveBeenCalled();
+      await expect(stat(join(dataDir, 'exports', `${id}.zip`))).rejects.toMatchObject({ code: 'ENOENT' });
+    } finally {
+      const actual = await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises');
+      vi.mocked(readFile).mockReset(); vi.mocked(readFile).mockImplementation(actual.readFile);
+    }
+  }, 120000);
+  it.each(['canceled', 'expired'] as const)('stops reading remaining attachments when a pending export is %s', async ending => {
+    const { app, projectId, ownerHeaders } = await setup();
+    await uploadAttachment(app, projectId, 'cancel-read-a', Buffer.from('first'));
+    await uploadAttachment(app, projectId, 'cancel-read-b', Buffer.from('second'));
+    const start = await app.inject({ method: 'POST', url: `/api/v1/projects/${projectId}/exports`, headers: agentHeaders, payload: { requestId: 'cancel-during-read' } });
+    const id = start.json().resourceId as string;
+    let release = () => {};
+    let captured = () => {};
+    const gate = new Promise<void>(resolveGate => { release = resolveGate; });
+    const started = new Promise<void>(resolveStarted => { captured = resolveStarted; });
+    vi.mocked(readFile).mockClear();
+    vi.mocked(readFile).mockImplementationOnce(async () => { captured(); await gate; return Buffer.from('first'); });
+    try {
+      const pending = app.inject({ url: `/api/v1/exports/${id}`, headers: ownerHeaders });
+      await started;
+      if (ending === 'canceled') {
+        const canceled = await app.inject({ method: 'POST', url: `/api/v1/exports/${id}/cancel`, headers: ownerHeaders, payload: { requestId: 'cancel-during-read-confirmed' } });
+        expect(canceled.statusCode).toBe(200);
+      } else {
+        vi.useFakeTimers({ toFake: ['Date'] });
+        vi.setSystemTime(Date.now() + 301_000);
+      }
+      release();
+      expect((await pending).json().status).toBe(ending === 'canceled' ? 'canceled' : 'failed');
+      expect(vi.mocked(readFile)).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+      release(); vi.mocked(readFile).mockReset();
+      const actual = await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises');
+      vi.mocked(readFile).mockImplementation(actual.readFile);
+    }
+  });
+  it('does not write a newly opened export file after cancellation', async () => {
+    const { app, dataDir, projectId, ownerHeaders } = await setup();
+    const start = await app.inject({ method: 'POST', url: `/api/v1/projects/${projectId}/exports`, headers: agentHeaders, payload: { requestId: 'cancel-during-open' } });
+    const id = start.json().resourceId as string;
+    const actual = await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises');
+    let release = () => {};
+    let captured = () => {};
+    const gate = new Promise<void>(resolveGate => { release = resolveGate; });
+    const started = new Promise<void>(resolveStarted => { captured = resolveStarted; });
+    let writeCalls = 0;
+    vi.mocked(open).mockImplementationOnce(async (path, flags, mode) => {
+      const handle = await actual.open(path, flags, mode);
+      const originalWrite = handle.writeFile.bind(handle);
+      vi.spyOn(handle, 'writeFile').mockImplementation(async (...args) => { writeCalls++; return originalWrite(...args); });
+      captured(); await gate; return handle;
+    });
+    try {
+      const pending = app.inject({ url: `/api/v1/exports/${id}`, headers: ownerHeaders });
+      await started;
+      const canceled = await app.inject({ method: 'POST', url: `/api/v1/exports/${id}/cancel`, headers: ownerHeaders, payload: { requestId: 'cancel-during-open-confirmed' } });
+      expect(canceled.statusCode).toBe(200);
+      release();
+      expect((await pending).json().status).toBe('canceled');
+      expect(writeCalls).toBe(0);
+      await expect(stat(join(dataDir, 'exports', `${id}.zip`))).rejects.toMatchObject({ code: 'ENOENT' });
+    } finally {
+      release(); vi.mocked(open).mockReset(); vi.mocked(open).mockImplementation(actual.open);
+    }
+  });
+  it('preserves a pre-existing output file if exclusive creation fails', async () => {
+    const { app, dataDir, projectId, ownerHeaders } = await setup();
+    const start = await app.inject({ method: 'POST', url: `/api/v1/projects/${projectId}/exports`, headers: agentHeaders, payload: { requestId: 'existing-export-file' } });
+    const id = start.json().resourceId as string;
+    const path = join(dataDir, 'exports', `${id}.zip`);
+    await mkdir(join(dataDir, 'exports'), { recursive: true });
+    await writeFile(path, 'existing data');
+    expect((await app.inject({ url: `/api/v1/exports/${id}`, headers: ownerHeaders })).json().status).toBe('failed');
+    expect(await readFile(path, 'utf8')).toBe('existing data');
+  });
+  it('removes the incomplete export file when publishing its status fails', async () => {
+    const { app, dataDir, projectId } = await setup();
+    await app.close(); apps.splice(apps.indexOf(app), 1);
+    const db = new Database(join(dataDir, 'specmill.db'));
+    try { db.exec("CREATE TRIGGER fail_export_ready BEFORE UPDATE OF status ON export_operations WHEN NEW.status = 'ready' BEGIN SELECT RAISE(ABORT, 'simulated failure'); END"); } finally { db.close(); }
+    const restarted = await buildApp({ dataDir, port: 43222, ownerToken: 'owner-token', agentToken: 'agent-token' }); apps.push(restarted);
+    await restarted.listen({ host: '127.0.0.1', port: 43222 });
+    const login = await restarted.inject({ method: 'POST', url: '/api/v1/session', headers, payload: { token: 'owner-token' } });
+    const owner = { ...headers, cookie: login.headers['set-cookie'] as string, 'x-specmill-request': '1' };
+    const start = await restarted.inject({ method: 'POST', url: `/api/v1/projects/${projectId}/exports`, headers: agentHeaders, payload: { requestId: 'failed-publish' } });
+    const id = start.json().resourceId as string;
+    const status = await restarted.inject({ url: `/api/v1/exports/${id}`, headers: owner });
+    expect(status.json().status).toBe('failed');
+    await expect(stat(join(dataDir, 'exports', `${id}.zip`))).rejects.toMatchObject({ code: 'ENOENT' });
+  }, 30000);
+  it('returns a consistent result for concurrent status requests', async () => {
+    const { app, projectId, ownerHeaders } = await setup();
+    await uploadAttachment(app, projectId, 'concurrent-att', Buffer.alloc(1024 * 1024, 7));
+    const start = await app.inject({ method: 'POST', url: `/api/v1/projects/${projectId}/exports`, headers: agentHeaders, payload: { requestId: 'concurrent-export' } });
+    const id = start.json().resourceId as string;
+    const responses = await Promise.all(Array.from({ length: 4 }, () => app.inject({ url: `/api/v1/exports/${id}`, headers: ownerHeaders })));
+    expect(responses.map(response => response.json().status)).toEqual(['ready', 'ready', 'ready', 'ready']);
+    expect((await app.inject({ url: `/api/v1/exports/${id}`, headers: ownerHeaders })).json().status).toBe('ready');
+    expect((await app.inject({ url: `/api/v1/exports/${id}/download`, headers: ownerHeaders })).statusCode).toBe(200);
+  }, 30000);
   it('exports a consistent zip with manifest, records and verified attachments without credentials', async () => {
     const { app, projectId, ownerHeaders } = await setup();
     const logContent = Buffer.from('证据日志内容\n第二行\n', 'utf8');
@@ -82,9 +246,13 @@ describe('project recovery export', () => {
     expect(start.statusCode).toBe(201);
     expect(start.json().status).toBe('preparing');
     const operationId = start.json().resourceId as string;
+    const preparingReceipt = await app.inject({ url: '/api/v1/receipts/export-1', headers: ownerHeaders });
+    expect(preparingReceipt.statusCode).toBe(200);
+    expect(preparingReceipt.json()).toEqual({ requestId: 'export-1', resourceId: operationId, status: 'preparing' });
     // 首次状态查询触发惰性生成
     const status = await app.inject({ url: `/api/v1/exports/${operationId}`, headers: ownerHeaders });
     expect(status.json().status).toBe('ready');
+    expect((await app.inject({ url: '/api/v1/receipts/export-1', headers: ownerHeaders })).json()).toEqual({ requestId: 'export-1', resourceId: operationId, status: 'ready' });
     const sha256 = status.json().sha256 as string;
     // 操作状态不占用项目预算
     const usedAfter = (await app.inject({ url: `/api/v1/projects/${projectId}/capacity`, headers: ownerHeaders })).json().records as { used: number };
@@ -100,7 +268,7 @@ describe('project recovery export', () => {
     const entries = readZipEntries(zip);
     const manifest = JSON.parse(entries.get('manifest.json')!.toString('utf8')) as { formatVersion: number; schemaVersion: number; projectId: string; files: { path: string; sha256: string; size: number }[] };
     expect(manifest.formatVersion).toBe(1);
-    expect(manifest.schemaVersion).toBe(16);
+    expect(manifest.schemaVersion).toBe(18);
     expect(manifest.projectId).toBe(projectId);
     for (const file of manifest.files) {
       const content = entries.get(file.path)!;

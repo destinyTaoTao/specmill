@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 // 本地安装包验证（K17）：npm pack → 内容检查 → 隔离目录安装 tgz →
 // 从安装产物启动服务 → 浏览器外完成登录/项目/会话/保存/交接最小闭环。
-// 报告安装是否需要网络（优先离线缓存，失败回退在线）。
+// 报告离线安装是否成功（失败后回退允许联网的安装）。
 import { spawn, spawnSync, execFileSync } from 'node:child_process';
-import { mkdtemp, rm, writeFile, readFile } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile, readFile, realpath } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -28,9 +28,10 @@ function runGit(args) {
 
 try {
   // 1. 打包
-  const tgzName = execFileSync('npm', ['pack', '--json'], { cwd: projectRoot, encoding: 'utf8', shell: process.platform === 'win32' });
+  const packDestination = process.platform === 'win32' ? `"${workDir}"` : workDir;
+  const tgzName = execFileSync('npm', ['pack', '--json', '--pack-destination', packDestination], { cwd: projectRoot, encoding: 'utf8', shell: process.platform === 'win32' });
   const packed = JSON.parse(tgzName)[0];
-  tgzPath = resolve(projectRoot, packed.filename);
+  tgzPath = resolve(workDir, packed.filename);
   log(`打包完成：${packed.filename}（${packed.size} 字节，入口数 ${packed.entryCount}）`);
   const names = packed.files.map(file => file.path);
   // 2. 内容检查：必需产物在；个人数据与开发产物不在
@@ -41,21 +42,21 @@ try {
   if (forbidden.length > 0) throw new Error(`安装包含不应打包的内容：${forbidden.join('、')}`);
   log(`内容检查通过：${required.length} 项必需资源在位，无个人数据／测试产物／源码。`);
 
-  // 3. 隔离安装（先尝试离线缓存，回退在线；记录网络需求）
+  // 3. 隔离安装（先尝试严格离线，失败后允许联网）
   let networkNeeded = false;
   const install = (offline) => {
     // Windows 上 npm 是 .cmd，需要 shell；路径加引号避免空格问题。
-    const command = ['npm', 'install', '--no-audit', '--no-fund', '--loglevel=error', ...(offline ? ['--prefer-offline'] : []), `"${tgzPath}"`].join(' ');
+    const command = ['npm', 'install', '--no-audit', '--no-fund', '--no-save', '--package-lock=false', '--loglevel=error', '--prefix', `"${installDir}"`, ...(offline ? ['--offline'] : []), `"${tgzPath}"`].join(' ');
     return spawnSync(command, { cwd: installDir, encoding: 'utf8', timeout: 240000, shell: process.platform === 'win32' });
   };
   let installResult = install(true);
   if (installResult.status !== 0) {
-    log('离线优先安装失败，回退在线安装（安装依赖需要网络）。');
+    log('离线安装失败，回退允许联网的安装。');
     networkNeeded = true;
     installResult = install(false);
   }
   if (installResult.status !== 0) throw new Error(`隔离安装失败：${String(installResult.stderr || installResult.stdout || installResult.error).slice(0, 2000)}`);
-  log(`隔离安装完成${networkNeeded ? '（需要网络下载依赖）' : '（离线缓存可用，无需网络）'}。`);
+  log(`隔离安装完成${networkNeeded ? '（允许联网的安装成功；离线安装未通过）' : '（离线缓存可用，无需网络）'}。`);
 
   const packageDir = join(installDir, 'node_modules', 'specmill');
   const packageJson = JSON.parse(await readFile(join(packageDir, 'package.json'), 'utf8'));
@@ -94,6 +95,12 @@ try {
   const workspace = await post(`/api/v1/projects/${project.resourceId}/workspaces`, { requestId: 'verify-workspace', expectedVersion: null, payload: { workspaceId: null, path: repoDir } });
   const change = await post(`/api/v1/projects/${project.resourceId}/changes`, { requestId: 'verify-change', expectedVersion: null, payload: { title: '安装验证变更', goal: '', scope: '', nonGoals: '', criteria: ['安装包可运行'] } });
   log('HTTP 闭环通过：登录、项目、工作区、变更创建成功（原生 SQLite 可用）。');
+  const overviewResponse = await fetch(`${base}/api/v1/project-overviews`, { headers: { origin: base, cookie } });
+  if (!overviewResponse.ok) throw new Error(`安装产物项目摘要读取失败：${overviewResponse.status}`);
+  const overview = (await overviewResponse.json()).projects.find(item => item.projectId === project.resourceId);
+  const actualRepoDir = await realpath(repoDir);
+  if (!overview || overview.activeChanges !== 1 || !overview.workspaces.some(item => item.path === actualRepoDir && item.directoryStatus === 'present' && !item.needsBinding)) throw new Error('安装产物项目摘要内容不符。');
+  log('安装产物项目摘要检查通过。');
 
   // 7. CLI 最小闭环：会话 → 观察 → 保存点 → 交接 → 释放
   const cli = (args) => {
@@ -107,7 +114,13 @@ try {
   const checkpointBody = join(workDir, 'verify-checkpoint.json');
   await writeFile(checkpointBody, JSON.stringify({ done: '安装包内完成保存', failures: '无', unverified: '无', blockers: '无', nextSteps: '验证交接' }), 'utf8');
   cli(['checkpoint', 'save', '--change', change.resourceId, '--version', '2', '--request-id', 'verify-checkpoint', '--observation', observation.resourceId, '--grant-file', grantFile, '--file', checkpointBody]);
-  const handoff = cli(['handoff', 'create', '--change', change.resourceId, '--request-id', 'verify-handoff']);
+  const handoff = cli(['handoff', 'create', '--change', change.resourceId, '--grant-file', grantFile, '--request-id', 'verify-handoff']);
+  const head = runGit(['rev-parse', 'HEAD']).trim();
+  const target = cli(['target', 'add', '--change', change.resourceId, '--commit', head, '--workspace', workspace.resourceId, '--grant-file', grantFile, '--request-id', 'verify-target']);
+  const targetList = cli(['target', 'list', '--change', change.resourceId]);
+  const recordedTarget = targetList.targets.find(item => item.id === target.resourceId);
+  if (!recordedTarget || recordedTarget.workspaceId !== workspace.resourceId || recordedTarget.workspacePath !== actualRepoDir || recordedTarget.workspaceVersion !== 1 || recordedTarget.commitSha !== head) throw new Error('安装产物目标候选工作区信息不符。');
+  log('CLI 目标候选工作区选择与查询通过。');
   cli(['session', 'release', '--grant-file', grantFile, '--version', '3', '--request-id', 'verify-release']);
   log(`CLI 闭环通过：会话 ${session.resourceId.slice(0, 8)}…、观察、保存点、交接快照 ${handoff.resourceId.slice(0, 8)}…、释放全部成功。`);
 
@@ -122,14 +135,14 @@ try {
   log(`验证失败：${error.message}`);
   process.exitCode = 1;
 } finally {
-  if (server) {
+  if (server && server.exitCode === null && server.signalCode === null) {
+    const exited = new Promise(resolveExit => server.once('exit', resolveExit));
     server.kill();
-    await new Promise(resolveExit => server.once('exit', () => resolveExit()));
+    await exited;
   }
   await rm(installDir, { recursive: true, force: true }).catch(() => {});
   await rm(dataDir, { recursive: true, force: true }).catch(() => {});
   await rm(dataDir + '.lock', { recursive: true, force: true }).catch(() => {});
   await rm(repoDir, { recursive: true, force: true }).catch(() => {});
   await rm(workDir, { recursive: true, force: true }).catch(() => {});
-  await rm(tgzPath, { force: true }).catch(() => {});
 }

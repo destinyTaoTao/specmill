@@ -27,8 +27,20 @@ test('a user starts and releases a manual writer session', async ({ page }) => {
     const create = page.getByRole('form', { name: '新建变更' });
     await create.getByLabel('变更标题').fill('需要续做');
     await create.getByLabel('目标', { exact: true }).fill('完成一次续做');
+    let failSessionRead = true;
+    await page.route('**/api/v1/changes/*/writer-sessions', async route => {
+      if (route.request().method() === 'GET' && failSessionRead) {
+        failSessionRead = false;
+        await route.fulfill({ status: 503, json: { message: '模拟会话读取失败' } });
+      } else await route.continue();
+    });
     await create.getByRole('button', { name: '创建变更' }).click();
+    await expect(page.getByRole('alert').filter({ hasText: '读取写会话失败，请重试' })).toBeVisible();
+    await expect(page.getByRole('button', { name: '开始手动会话' })).toHaveCount(0);
+    await page.getByRole('button', { name: '刷新会话状态' }).click();
     await expect(page.getByText('当前没有活跃写会话。')).toBeVisible();
+    await expect(page.getByRole('alert').filter({ hasText: '读取写会话失败，请重试' })).toHaveCount(0);
+    await page.unroute('**/api/v1/changes/*/writer-sessions');
     await page.getByLabel('会话工作区').selectOption({ index: 1 });
     await page.getByRole('button', { name: '开始手动会话' }).click();
     await expect(page.getByText(/活跃：Web 手动 · 代次 1/)).toBeVisible();

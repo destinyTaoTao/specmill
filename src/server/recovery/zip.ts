@@ -17,8 +17,16 @@ export function crc32(data: Buffer): number {
 }
 
 export type ZipEntry = { name: string; data: Buffer };
+export class ZipFormatError extends Error {}
+export const MAX_ZIP_ENTRIES = 65535;
+
+// STORE 格式的本地头、中央目录和结束记录都没有额外字段。
+export function zipSize(entries: ZipEntry[]): number {
+  return 22 + entries.reduce((total, entry) => total + 30 + 46 + 2 * Buffer.byteLength(entry.name, 'utf8') + entry.data.length, 0);
+}
 
 export function buildZip(entries: ZipEntry[]): Buffer {
+  if (entries.length > MAX_ZIP_ENTRIES) throw new ZipFormatError('ZIP 文件项超过格式上限。');
   const localParts: Buffer[] = [];
   const centralParts: Buffer[] = [];
   let offset = 0;
@@ -73,9 +81,7 @@ export function buildZip(entries: ZipEntry[]): Buffer {
   return Buffer.concat([...localParts, ...centralParts, eocd]);
 }
 
-export class ZipFormatError extends Error {}
 const MAX_ENTRY_BYTES = 64 * 1024 * 1024;
-const MAX_ENTRIES = 20000;
 
 // 严格解析 STORE ZIP：仅接受本工具生成的结构；拒绝压缩方法、路径穿越、
 // 异常规模与签名不符的内容。
@@ -85,34 +91,61 @@ export function parseZip(zip: Buffer, allowedName: (name: string) => boolean): M
     if (zip.readUInt32LE(index) === 0x06054b50) { eocdOffset = index; break; }
   }
   if (eocdOffset < 0) throw new ZipFormatError('ZIP 结束记录缺失。');
+  if (zip.readUInt16LE(eocdOffset + 4) !== 0 || zip.readUInt16LE(eocdOffset + 6) !== 0 ||
+      eocdOffset + 22 + zip.readUInt16LE(eocdOffset + 20) !== zip.length) throw new ZipFormatError('ZIP 结束记录异常。');
   const entryCount = zip.readUInt16LE(eocdOffset + 8);
   const declaredCount = zip.readUInt16LE(eocdOffset + 10);
-  if (entryCount !== declaredCount || entryCount > MAX_ENTRIES) throw new ZipFormatError('ZIP 文件项数异常。');
+  if (entryCount !== declaredCount || entryCount > MAX_ZIP_ENTRIES) throw new ZipFormatError('ZIP 文件项数异常。');
   const centralOffset = zip.readUInt32LE(eocdOffset + 16);
-  if (centralOffset > zip.length) throw new ZipFormatError('ZIP 中央目录越界。');
-  const entries = new Map<string, Buffer>();
+  const centralSize = zip.readUInt32LE(eocdOffset + 12);
+  if (centralOffset + centralSize !== eocdOffset) throw new ZipFormatError('ZIP 中央目录越界。');
+  const names = new Set<string>();
+  const localRanges: { name: string; start: number; dataStart: number; end: number; crc: number }[] = [];
   let cursor = centralOffset;
   for (let index = 0; index < entryCount; index++) {
-    if (cursor + 46 > zip.length || zip.readUInt32LE(cursor) !== 0x02014b50) throw new ZipFormatError('ZIP 中央目录损坏。');
+    if (cursor + 46 > eocdOffset || zip.readUInt32LE(cursor) !== 0x02014b50) throw new ZipFormatError('ZIP 中央目录损坏。');
+    const flags = zip.readUInt16LE(cursor + 8);
     const method = zip.readUInt16LE(cursor + 10);
     const compressedSize = zip.readUInt32LE(cursor + 20);
+    const uncompressedSize = zip.readUInt32LE(cursor + 24);
     const nameLength = zip.readUInt16LE(cursor + 28);
     const extraLength = zip.readUInt16LE(cursor + 30);
     const commentLength = zip.readUInt16LE(cursor + 32);
     const localOffset = zip.readUInt32LE(cursor + 42);
-    if (method !== 0) throw new ZipFormatError('ZIP 仅支持不压缩的条目。');
-    const name = zip.slice(cursor + 46, cursor + 46 + nameLength).toString('utf8');
+    const nextCursor = cursor + 46 + nameLength + extraLength + commentLength;
+    if (nextCursor > eocdOffset || zip.readUInt16LE(cursor + 34) !== 0) throw new ZipFormatError('ZIP 中央目录损坏。');
+    if (flags !== 0x0800 || method !== 0 || compressedSize !== uncompressedSize) throw new ZipFormatError('ZIP 仅支持 UTF-8 不压缩的条目。');
+    if (compressedSize > MAX_ENTRY_BYTES) throw new ZipFormatError('ZIP 条目超过大小限制。');
+    const platform = zip.readUInt16LE(cursor + 4) >>> 8;
+    const unixMode = zip.readUInt32LE(cursor + 38) >>> 16;
+    if (platform === 3 && (unixMode & 0xf000) === 0xa000) throw new ZipFormatError('ZIP 不支持符号链接。');
+    const nameBytes = zip.subarray(cursor + 46, cursor + 46 + nameLength);
+    const name = nameBytes.toString('utf8');
     if (!allowedName(name)) throw new ZipFormatError(`ZIP 包含不允许的文件项：${name}`);
-    if (entries.has(name)) throw new ZipFormatError(`ZIP 包含重复文件项：${name}`);
-    if (localOffset + 30 > zip.length || zip.readUInt32LE(localOffset) !== 0x04034b50) throw new ZipFormatError('ZIP 本地头损坏。');
+    if (names.has(name)) throw new ZipFormatError(`ZIP 包含重复文件项：${name}`);
+    names.add(name);
+    if (localOffset + 30 > centralOffset || zip.readUInt32LE(localOffset) !== 0x04034b50) throw new ZipFormatError('ZIP 本地头损坏。');
     const localNameLength = zip.readUInt16LE(localOffset + 26);
-    const dataStart = localOffset + 30 + localNameLength;
-    if (dataStart + compressedSize > zip.length) throw new ZipFormatError('ZIP 条目数据越界。');
-    const data = zip.slice(dataStart, dataStart + compressedSize);
-    if (data.length > MAX_ENTRY_BYTES) throw new ZipFormatError('ZIP 条目超过大小限制。');
-    if (crc32(data) !== zip.readUInt32LE(cursor + 16)) throw new ZipFormatError(`ZIP 条目摘要不符：${name}`);
-    entries.set(name, Buffer.from(data));
-    cursor += 46 + nameLength + extraLength + commentLength;
+    const dataStart = localOffset + 30 + localNameLength + zip.readUInt16LE(localOffset + 28);
+    if (dataStart + compressedSize > centralOffset || localNameLength !== nameLength ||
+        !zip.subarray(localOffset + 30, localOffset + 30 + localNameLength).equals(nameBytes) ||
+        zip.readUInt16LE(localOffset + 6) !== flags || zip.readUInt16LE(localOffset + 8) !== method ||
+        zip.readUInt32LE(localOffset + 14) !== zip.readUInt32LE(cursor + 16) ||
+        zip.readUInt32LE(localOffset + 18) !== compressedSize || zip.readUInt32LE(localOffset + 22) !== uncompressedSize) throw new ZipFormatError('ZIP 本地头与中央目录不一致。');
+    localRanges.push({ name, start: localOffset, dataStart, end: dataStart + compressedSize, crc: zip.readUInt32LE(cursor + 16) });
+    cursor = nextCursor;
+  }
+  if (cursor !== eocdOffset) throw new ZipFormatError('ZIP 中央目录大小不符。');
+  localRanges.sort((a, b) => a.start - b.start);
+  for (let index = 1; index < localRanges.length; index++) {
+    if (localRanges[index].start < localRanges[index - 1].end) throw new ZipFormatError('ZIP 条目重叠。');
+  }
+  // 在复制或计算摘要前先确认条目互不重叠，避免恶意目录反复引用大段数据。
+  const entries = new Map<string, Buffer>();
+  for (const range of localRanges) {
+    const data = zip.subarray(range.dataStart, range.end);
+    if (crc32(data) !== range.crc) throw new ZipFormatError(`ZIP 条目摘要不符：${range.name}`);
+    entries.set(range.name, Buffer.from(data));
   }
   return entries;
 }

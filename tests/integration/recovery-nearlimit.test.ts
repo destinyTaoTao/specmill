@@ -14,8 +14,11 @@ afterEach(async () => {
 
 // 近上限往返：预警区（≥80%）导出 → 同限实例恢复 → 再导出，逐字节比较记录投影。
 describe('near-limit recovery round trip', () => {
-  it('restores a warning-zone package under the same limit and re-exports identical records', async () => {
-    const limit = 9000;
+  it.each([
+    { label: 'scaled budget', limit: 9000, attachmentSize: 512, maxUploads: 20 },
+    { label: 'default 20 MiB budget', limit: 20 * 1024 * 1024, attachmentSize: 4.5 * 1024 * 1024, maxUploads: 4 },
+  ])('restores and re-exports a warning-zone package with $label', async ({ limit, attachmentSize, maxUploads }) => {
+    const startedAt = performance.now();
     const make = async (port: number, tag: string) => {
       const dataDir = await mkdtemp(join(tmpdir(), `specmill-nearlimit-${tag}-`)); dirs.push(dataDir);
       const repoDir = await mkdtemp(join(tmpdir(), `specmill-nearlimit-repo-${tag}-`)); dirs.push(repoDir);
@@ -62,9 +65,12 @@ describe('near-limit recovery round trip', () => {
     // 填充到预警区：附件字节全额计入预算
     let used = 0;
     let warning = false;
-    for (let round = 0; round < 20 && !warning; round++) {
-      const upload = await source.app.inject({ method: 'POST', url: `/api/v1/projects/${project.resourceId}/attachments?requestId=nearlimit-att-${round}&filename=fill-${round}.bin`, headers: { ...agentH, 'content-type': 'application/octet-stream' }, payload: Buffer.alloc(512) });
+    const contents: Buffer[] = [];
+    for (let round = 0; round < maxUploads && !warning; round++) {
+      const content = Buffer.alloc(attachmentSize, round + 1);
+      const upload = await source.app.inject({ method: 'POST', url: `/api/v1/projects/${project.resourceId}/attachments?requestId=nearlimit-att-${round}&filename=fill-${round}.bin`, headers: { ...source.ownerHeaders, 'content-type': 'application/octet-stream' }, payload: content });
       expect(upload.statusCode).toBe(201);
+      contents.push(content);
       const budget = (await source.app.inject({ url: `/api/v1/projects/${project.resourceId}/capacity`, headers: source.ownerHeaders })).json().records as { used: number; limit: number; warning: boolean };
       used = budget.used; warning = budget.warning;
     }
@@ -75,7 +81,11 @@ describe('near-limit recovery round trip', () => {
     expect(exportOp.statusCode).toBe(201);
     await source.app.inject({ url: `/api/v1/exports/${exportOp.json().resourceId}`, headers: source.ownerHeaders });
     const zip1 = (await source.app.inject({ url: `/api/v1/exports/${exportOp.json().resourceId}/download`, headers: source.ownerHeaders })).rawPayload!;
-    const records1 = readZipEntries(zip1).get('records.json')!;
+    const files1 = readZipEntries(zip1);
+    const records1 = files1.get('records.json')!;
+    const attachments1 = [...files1].filter(([name]) => name.startsWith('attachments/'));
+    expect(attachments1).toHaveLength(contents.length);
+    for (const content of contents) expect(attachments1.some(([, data]) => data.equals(content))).toBe(true);
     // 同限实例恢复 → 用量一致 → 再导出，记录投影逐字节一致
     const target = await make(43214, 'dst');
     const restoreHeaders = { ...target.ownerHeaders, 'content-type': 'application/octet-stream' };
@@ -89,12 +99,16 @@ describe('near-limit recovery round trip', () => {
     expect(exportOp2.statusCode).toBe(201);
     await target.app.inject({ url: `/api/v1/exports/${exportOp2.json().resourceId}`, headers: target.ownerHeaders });
     const zip2 = (await target.app.inject({ url: `/api/v1/exports/${exportOp2.json().resourceId}/download`, headers: target.ownerHeaders })).rawPayload!;
-    const records2 = readZipEntries(zip2).get('records.json')!;
+    const files2 = readZipEntries(zip2);
+    const records2 = files2.get('records.json')!;
     expect(records2.equals(records1)).toBe(true);
+    for (const [name, content] of attachments1) expect(files2.get(name)?.equals(content)).toBe(true);
     // 恢复后超限新增被拒，历史仍可读
-    const overflow = await target.app.inject({ method: 'POST', url: `/api/v1/projects/${project.resourceId}/attachments?requestId=nearlimit-overflow&filename=overflow.bin`, headers: { ...targetAgentH, 'content-type': 'application/octet-stream' }, payload: Buffer.alloc(4096) });
+    const overflowBytes = Math.min(5 * 1024 * 1024, limit - budgetAfter.used + 1);
+    const overflow = await target.app.inject({ method: 'POST', url: `/api/v1/projects/${project.resourceId}/attachments?requestId=nearlimit-overflow&filename=overflow.bin`, headers: { ...target.ownerHeaders, 'content-type': 'application/octet-stream' }, payload: Buffer.alloc(overflowBytes) });
     expect(overflow.statusCode).toBe(413);
     const list = await target.app.inject({ url: `/api/v1/projects/${project.resourceId}/attachments`, headers: target.ownerHeaders });
     expect(list.statusCode).toBe(200);
+    if (limit === 20 * 1024 * 1024) console.info(`default-budget sample: used=${used} zip=${zip1.length} elapsedMs=${Math.round(performance.now() - startedAt)} processMaxRssKiB=${process.resourceUsage().maxRSS}`);
   }, 120000);
 });

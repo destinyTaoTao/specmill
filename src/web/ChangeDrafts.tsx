@@ -82,23 +82,34 @@ function DraftCard({ projectId, change, workspaces, refresh }: { projectId: stri
     <WriterSessionPanel change={change} workspaces={workspaces} refresh={refresh} />
     <HandoffPanel change={change} workspaces={workspaces} />
     <EvidencePanel projectId={projectId} change={change} refresh={refresh} />
-    {change.phase === 'Reviewing' || change.phase === 'Accepted' ? <ReviewPanel change={change} refresh={refresh} /> : null}
+    {(change.phase === 'Reviewing' || change.phase === 'Accepted' || (change.phase === 'Working' && change.baselineId)) && <ReviewPanel key={change.phase === 'Working' ? 'history' : 'review'} change={change} refresh={refresh} />}
     {showBaseline && <BaselinePanel projectId={projectId} change={change} workspaces={workspaces} refresh={refresh} canAdopt={change.phase !== 'Canceled'} />}
   </section>;
 }
 
 export function ChangeDrafts({ projectId, workspaces, onChanged }: { projectId: string; workspaces: Workspace[]; onChanged: () => Promise<void> }) {
-  const [changes, setChanges] = useState<Change[]>([]);
+  const [changes, setChanges] = useState<Change[] | null>(null);
   const [draft, setDraft] = useState(emptyDraft);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const requestId = useRef(crypto.randomUUID());
+  const refreshSequence = useRef(0);
   async function refresh() {
-    const result = await readJson<{ changes: Change[] }>(await fetch(`/api/v1/projects/${projectId}/changes`), '读取变更失败。');
-    setChanges(result.changes);
-    await onChanged();
+    const sequence = ++refreshSequence.current;
+    try {
+      const result = await readJson<{ changes: Change[] }>(await fetch(`/api/v1/projects/${projectId}/changes`), '读取变更失败。');
+      if (sequence !== refreshSequence.current) return;
+      setChanges(result.changes);
+      await onChanged();
+    } catch (error) {
+      if (sequence === refreshSequence.current) throw error;
+    }
   }
-  useEffect(() => { void refresh().catch(() => setError('读取变更失败，请返回后重试。')); }, [projectId]);
+  useEffect(() => {
+    let active = true;
+    void refresh().catch(() => { if (active) setError('读取变更失败，请返回后重试。'); });
+    return () => { active = false; refreshSequence.current++; };
+  }, [projectId]);
   async function create(event: FormEvent) {
     event.preventDefault(); setBusy(true); setError('');
     try {
@@ -108,8 +119,8 @@ export function ChangeDrafts({ projectId, workspaces, onChanged }: { projectId: 
       try { await refresh(); } catch { setError('变更已保存，但刷新失败；请返回后重新打开项目。'); }
     } catch (err) { setError(err instanceof ApiError ? err.message : '创建结果未知，可用原内容重试。'); } finally { setBusy(false); }
   }
-  return <section><h3>变更</h3>{error && <p role="alert">{error}</p>}
-    <form aria-label="新建变更" onSubmit={create}><Fields value={draft} disabled={busy} onChange={value => { setDraft(value); requestId.current = crypto.randomUUID(); }} /><button disabled={busy}>创建变更</button></form>
-    {changes.length === 0 ? <p>尚无变更。</p> : changes.map(change => <DraftCard key={change.id} projectId={projectId} change={change} workspaces={workspaces} refresh={refresh} />)}
+  return <section id="project-changes"><div className="section-heading"><h3>变更</h3><a href="#new-change">新建变更</a></div>{error && <p role="alert">{error}</p>}
+    {changes === null ? (!error && <p>正在读取变更。</p>) : changes.length === 0 ? <p>尚无变更。</p> : changes.map(change => <DraftCard key={change.id} projectId={projectId} change={change} workspaces={workspaces} refresh={refresh} />)}
+    <section id="new-change"><h4>新建变更</h4><form aria-label="新建变更" onSubmit={create}><Fields value={draft} disabled={busy} onChange={value => { setDraft(value); requestId.current = crypto.randomUUID(); }} /><button disabled={busy}>创建变更</button></form></section>
   </section>;
 }

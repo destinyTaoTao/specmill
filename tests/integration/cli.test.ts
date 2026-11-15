@@ -10,6 +10,7 @@ import { buildApp } from '../../src/server/app.js';
 import { decodeSecret, encodeSecret } from '../../src/shared/credentials.js';
 
 const runFile = promisify(execFile);
+const testAgentToken = 'c'.repeat(64);
 const dirs: string[] = [];
 const apps: Awaited<ReturnType<typeof buildApp>>[] = [];
 afterEach(async () => {
@@ -18,15 +19,107 @@ afterEach(async () => {
 });
 
 describe('thin CLI', () => {
+  it('refuses to send either credential to a port outside the credential binding', async () => {
+    const dataDir = await mkdtemp(join(tmpdir(), 'specmill-cli-port-')); dirs.push(dataDir);
+    const writerToken = 'b'.repeat(64);
+    const grantFile = join(dataDir, 'grant');
+    await writeFile(grantFile, await encodeSecret(JSON.stringify({ sessionId: 'session', generation: 1, writerToken })));
+    let requests = 0;
+    let authorization = ''; let writer = '';
+    const listener = createServer((request, response) => {
+      requests++;
+      authorization = request.headers.authorization ?? '';
+      writer = String(request.headers['x-specmill-writer-token'] ?? '');
+      request.resume();
+      response.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ requestId: 'port-release', resourceId: 'session', recordVersion: 2, committedAt: '2026-11-15T00:00:00.000Z' }));
+    });
+    await new Promise<void>(resolveListen => listener.listen(0, '127.0.0.1', resolveListen));
+    const port = (listener.address() as AddressInfo).port;
+    const token = 'a'.repeat(64);
+    const cli = () => runFile(process.execPath, ['--import', 'tsx', resolve('src/cli/main.ts'), 'session', 'release', '--grant-file', grantFile, '--version', '1', '--request-id', 'port-release', '--data-dir', dataDir, '--server', `http://127.0.0.1:${port}`, '--json'], { timeout: 20000 });
+    try {
+      await writeFile(join(dataDir, 'cli-token'), await encodeSecret(JSON.stringify({ format: 'specmill-cli-1', port: port === 65535 ? 65534 : port + 1, token })));
+      await expect(cli()).rejects.toMatchObject({ code: 2, stderr: expect.stringContaining('SERVER_MISMATCH') });
+      expect(requests).toBe(0);
+      await writeFile(join(dataDir, 'cli-token'), await encodeSecret(JSON.stringify({ format: 'specmill-cli-1', port, token })));
+      expect(JSON.parse((await cli()).stdout).resourceId).toBe('session');
+      expect(requests).toBe(1);
+      expect(authorization).toBe(`Bearer ${token}`);
+      expect(writer).toBe(writerToken);
+      await writeFile(join(dataDir, 'cli-token'), await encodeSecret('{broken'));
+      await expect(cli()).rejects.toMatchObject({ code: 6, stderr: expect.stringContaining('SERVICE_UNAVAILABLE') });
+      expect(requests).toBe(1);
+      await writeFile(join(dataDir, 'cli-token'), await encodeSecret(' corrupt credential'));
+      await expect(cli()).rejects.toMatchObject({ code: 6, stderr: expect.stringContaining('SERVICE_UNAVAILABLE') });
+      expect(requests).toBe(1);
+      await writeFile(join(dataDir, 'cli-token'), await encodeSecret(token));
+      expect(JSON.parse((await cli()).stdout).resourceId).toBe('session');
+      expect(requests).toBe(2);
+    } finally { await new Promise<void>(resolveClose => listener.close(() => resolveClose())); }
+  }, 30000);
+  it('passes the disposition version and rejects incomplete or mismatched operation receipts', async () => {
+    const dataDir = await mkdtemp(join(tmpdir(), 'specmill-cli-receipt-')); dirs.push(dataDir);
+    await writeFile(join(dataDir, 'cli-token'), await encodeSecret(testAgentToken));
+    const grantFile = join(dataDir, 'grant.json');
+    await writeFile(grantFile, await encodeSecret(JSON.stringify({ requestId: 'start', sessionId: 'session-id', generation: 1, writerToken: 'a'.repeat(64) })));
+    const rowsFile = join(dataDir, 'rows.json');
+    await writeFile(rowsFile, '[]');
+    const reviewFile = join(dataDir, 'review.json');
+    const snapshot = { version: 3, cycle: 1, baselineId: 'baseline', criterionRevisionId: 'revision', targetId: 'target', observationId: null, evidenceCount: 0, decisionCount: 0, dispositionCount: 0 };
+    await writeFile(reviewFile, JSON.stringify({ snapshot }));
+    let responseBody: Record<string, unknown> = {};
+    let receivedBody: Record<string, unknown> = {};
+    const server = createServer((request, response) => {
+      let body = '';
+      request.on('data', chunk => { body += String(chunk); });
+      request.on('end', () => { receivedBody = JSON.parse(body); response.writeHead(201, { 'content-type': 'application/json' }).end(JSON.stringify(responseBody)); });
+    });
+    await new Promise<void>(resolveListen => server.listen(0, '127.0.0.1', resolveListen));
+    const port = (server.address() as AddressInfo).port;
+    const cli = async (...args: string[]) => {
+      try {
+        const value = await runFile(process.execPath, ['--import', 'tsx', resolve('src/cli/main.ts'), ...args, '--data-dir', dataDir, '--server', `http://127.0.0.1:${port}`, '--json'], { timeout: 20000 });
+        return { code: 0, ...value };
+      } catch (error) { return error as Error & { code: number; stdout: string; stderr: string }; }
+    };
+    try {
+      responseBody = { requestId: 'target-request', resourceId: 'target-id', recordVersion: 1, committedAt: '2026-11-15T00:00:00.000Z' };
+      const target = await cli('target', 'add', '--change', 'change', '--commit', 'a'.repeat(40), '--workspace', 'workspace-id', '--grant-file', grantFile, '--request-id', 'target-request');
+      expect(target.code).toBe(0);
+      expect(receivedBody.payload).toEqual({ commit: 'a'.repeat(40), workspaceId: 'workspace-id' });
+      expect(receivedBody).toMatchObject({ writerSessionId: 'session-id', generation: 1 });
+      responseBody = { requestId: 'disposition-request', resourceId: 'preview' };
+      const disposition = await cli('review', 'disposition-preview', '--change', 'change', '--grant-file', grantFile, '--version', '3', '--file', rowsFile, '--request-id', 'disposition-request');
+      expect(disposition.code).toBe(0);
+      expect(receivedBody.expectedVersion).toBe(3);
+      responseBody = { requestId: 'guarded-preview', resourceId: 'preview' };
+      const guarded = await cli('review', 'preview', '--change', 'change', '--grant-file', grantFile, '--file', rowsFile, '--review-file', reviewFile, '--request-id', 'guarded-preview');
+      expect(guarded.code).toBe(0);
+      expect(receivedBody.expectedSnapshot).toEqual(snapshot);
+      await writeFile(reviewFile, '{}');
+      const missingSnapshot = await cli('review', 'preview', '--change', 'change', '--grant-file', grantFile, '--file', rowsFile, '--review-file', reviewFile, '--request-id', 'missing-snapshot');
+      expect(missingSnapshot.code).toBe(2);
+      expect(JSON.parse(missingSnapshot.stderr).code).toBe('INPUT_ERROR');
+      responseBody = {};
+      const emptyExport = await cli('export', 'start', '--project', 'project', '--request-id', 'export-request');
+      expect(emptyExport.code).toBe(6);
+      expect(JSON.parse(emptyExport.stderr).code).toBe('INVALID_RESPONSE');
+      responseBody = { requestId: 'different-request', resourceId: 'preview' };
+      const wrongPreview = await cli('review', 'preview', '--change', 'change', '--grant-file', grantFile, '--file', rowsFile, '--request-id', 'preview-request');
+      expect(wrongPreview.code).toBe(6);
+      expect(JSON.parse(wrongPreview.stderr).code).toBe('INVALID_RESPONSE');
+      expect(receivedBody).not.toHaveProperty('expectedSnapshot');
+    } finally { await new Promise<void>(resolveClose => server.close(() => resolveClose())); }
+  }, 30000);
   it('reads a change and starts/releases a scoped session through HTTP', async () => {
     const dataDir = await mkdtemp(join(tmpdir(), 'specmill-cli-data-')); dirs.push(dataDir);
     const repoDir = await mkdtemp(join(tmpdir(), 'specmill-cli-repo-')); dirs.push(repoDir);
     const init = spawnSync('git', ['-C', repoDir, 'init', '-q'], { encoding: 'utf8', env: { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: 'NUL' } });
     if (init.status !== 0) throw new Error(init.stderr);
-    const app = await buildApp({ dataDir, port: 43229, ownerToken: 'owner-token', agentToken: 'agent-token' }); apps.push(app);
+    const app = await buildApp({ dataDir, port: 43229, ownerToken: 'owner-token', agentToken: testAgentToken }); apps.push(app);
     await app.listen({ host: '127.0.0.1', port: 43229 });
-    const storedToken = await encodeSecret('agent-token');
-    if (process.platform === 'win32') expect(storedToken).not.toContain('agent-token');
+    const storedToken = await encodeSecret(testAgentToken);
+    if (process.platform === 'win32') expect(storedToken).not.toContain(testAgentToken);
     await writeFile(join(dataDir, 'cli-token'), storedToken, { mode: 0o600 });
     const headers = { host: '127.0.0.1:43229', origin: 'http://127.0.0.1:43229' };
     const login = await app.inject({ method: 'POST', url: '/api/v1/session', headers, payload: { token: 'owner-token' } });
@@ -42,6 +135,9 @@ describe('thin CLI', () => {
     const cli = (...args: string[]) => runFile(process.execPath, ['--import', 'tsx', resolve('src/cli/main.ts'), ...args, '--data-dir', dataDir, '--server', 'http://127.0.0.1:43229', '--json'], { timeout: 20000 });
     const shown = await cli('change', 'show', '--change', changeId);
     expect(JSON.parse(shown.stdout)).toEqual(expect.objectContaining({ id: changeId, phase: 'Draft', version: 1 }));
+    const exportStarted = JSON.parse((await cli('export', 'start', '--project', projectId, '--request-id', 'cli-export')).stdout);
+    expect(exportStarted).toEqual(expect.objectContaining({ requestId: 'cli-export', status: 'preparing', resourceId: expect.any(String) }));
+    expect(JSON.parse((await cli('export', 'status', '--operation', exportStarted.resourceId)).stdout).status).toBe('ready');
     const grantFile = join(dataDir, 'grant.json');
     const started = await cli('session', 'start', '--change', changeId, '--workspace', workspaceId, '--binding-version', '1', '--version', '1', '--tool', 'CLI A', '--request-id', 'cli-start', '--grant-file', grantFile);
     const storedGrant = await readFile(grantFile, 'utf8');
@@ -73,7 +169,7 @@ describe('thin CLI', () => {
   it('does not forward writer credentials on redirects and treats corrupt success responses as unknown', async () => {
     const dataDir = await mkdtemp(join(tmpdir(), 'specmill-cli-network-')); dirs.push(dataDir);
     const writerToken = 'a'.repeat(64);
-    await writeFile(join(dataDir, 'cli-token'), await encodeSecret('agent-token'));
+    await writeFile(join(dataDir, 'cli-token'), await encodeSecret(testAgentToken));
     const grantFile = join(dataDir, 'grant');
     await writeFile(grantFile, await encodeSecret(JSON.stringify({ requestId: 'start', sessionId: 'session', generation: 1, writerToken })));
     let followed = false;

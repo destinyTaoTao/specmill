@@ -2,7 +2,7 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import type Database from 'better-sqlite3';
 import { randomUUID } from 'node:crypto';
 import { checkProjectCapacity, projectRecordBytes } from '../storage/project-capacity.js';
-import { requestIdUsedElsewhere, sameFingerprint } from '../storage/request-ids.js';
+import { requestIdIsAmbiguous, requestIdUsedElsewhere, sameFingerprint } from '../storage/request-ids.js';
 import type { WriterAuthorization } from './writer-sessions.js';
 
 type Input = { requestId: string; expectedVersion: number; writerSessionId: string; generation: number; payload: { observationId: string; done: string; failures: string; unverified: string; blockers: string; nextSteps: string } };
@@ -13,6 +13,7 @@ function error(request: FastifyRequest, reply: FastifyReply, status: number, cod
 
 export function registerCheckpoints(app: FastifyInstance, db: Database.Database, recordsLimit: number, isOwner: (request: FastifyRequest) => boolean, authorizeWriter: WriterAuthorization) {
   app.get<{ Params: { requestId: string } }>('/api/v1/receipts/:requestId', async (request, reply) => {
+    if (requestIdIsAmbiguous(db, request.params.requestId)) return error(request, reply, 409, 'REQUEST_ID_CONFLICT', '该请求标识关联多条历史记录，无法确定回执，请核对相关记录。');
     const sql = [
       'SELECT r.project_id AS resourceId, 1 AS recordVersion, p.created_at AS committedAt FROM requests r JOIN projects p ON p.id = r.project_id WHERE r.request_id = ?',
       'SELECT resource_id AS resourceId, record_version AS recordVersion, committed_at AS committedAt FROM workspace_requests WHERE request_id = ?',
@@ -21,11 +22,23 @@ export function registerCheckpoints(app: FastifyInstance, db: Database.Database,
       'SELECT baseline_id AS resourceId, record_version AS recordVersion, committed_at AS committedAt FROM baseline_requests WHERE request_id = ?',
       'SELECT session_id AS resourceId, record_version AS recordVersion, committed_at AS committedAt FROM writer_session_requests WHERE request_id = ?',
       'SELECT checkpoint_id AS resourceId, record_version AS recordVersion, committed_at AS committedAt FROM checkpoint_requests WHERE request_id = ?',
+      'SELECT snapshot_id AS resourceId, 1 AS recordVersion, committed_at AS committedAt FROM handoff_requests WHERE request_id = ?',
+      'SELECT execution_id AS resourceId, record_version AS recordVersion, committed_at AS committedAt FROM execution_requests WHERE request_id = ?',
+      'SELECT evidence_id AS resourceId, record_version AS recordVersion, committed_at AS committedAt FROM evidence_requests WHERE request_id = ?',
+      "SELECT target_id AS resourceId, 1 AS recordVersion, committed_at AS committedAt FROM acceptance_target_requests WHERE request_id = ? AND action = 'create'",
+      'SELECT proposal_id AS resourceId, record_version AS recordVersion, committed_at AS committedAt FROM acceptance_proposal_requests WHERE request_id = ?',
+      'SELECT attachment_id AS resourceId, 1 AS recordVersion, committed_at AS committedAt FROM attachment_requests WHERE request_id = ?',
+      'SELECT resource_id AS resourceId, record_version AS recordVersion, committed_at AS committedAt FROM review_requests WHERE request_id = ? AND record_version IS NOT NULL',
     ];
     for (const query of sql) {
       const found = db.prepare(query).get(request.params.requestId) as { resourceId: string; recordVersion: number; committedAt: string } | undefined;
       if (found) return { requestId: request.params.requestId, ...found };
     }
+    const targetConfirmation = db.prepare("SELECT target_id AS resourceId, committed_at AS confirmedAt FROM acceptance_target_requests WHERE request_id = ? AND action = 'confirm'").get(request.params.requestId) as { resourceId: string; confirmedAt: string } | undefined;
+    if (targetConfirmation) return { requestId: request.params.requestId, resourceId: targetConfirmation.resourceId, status: 'confirmed', confirmedAt: targetConfirmation.confirmedAt };
+    // 导出状态会变化，按创建请求查询时返回当前状态，与原请求重放一致。
+    const exportOperation = db.prepare('SELECT id AS resourceId, status FROM export_operations WHERE request_id = ?').get(request.params.requestId) as { resourceId: string; status: string } | undefined;
+    if (exportOperation) return { requestId: request.params.requestId, ...exportOperation };
     return error(request, reply, 404, 'NOT_FOUND', '没有找到该请求的已保存回执。');
   });
 

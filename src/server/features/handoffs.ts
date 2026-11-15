@@ -1,10 +1,12 @@
-import type { FastifyInstance } from 'fastify';
+import type { FastifyInstance, FastifyRequest } from 'fastify';
 import type Database from 'better-sqlite3';
 import { createHash, randomUUID } from 'node:crypto';
 import { checkProjectCapacity, projectRecordBytes } from '../storage/project-capacity.js';
 import { requestIdUsedElsewhere } from '../storage/request-ids.js';
 import { identifyWorkspace, observeWorkspace, ObservationTempInsideWorkspace, pathKey } from '../workspace/git.js';
 import { renderHandoffMarkdown, type HandoffContent } from '../../shared/handoff.js';
+import type { WriterAuthorization } from './writer-sessions.js';
+import { createWriterGuard, writerCommand, writerGrantMessage, type WriterGrant } from './writer-guard.js';
 
 type Receipt = { requestId: string; resourceId: string; recordVersion: number; committedAt: string };
 
@@ -48,7 +50,8 @@ export function createHandoffSnapshotRow(db: Database.Database, changeId: string
   return { snapshotId, committedAt };
 }
 
-export function registerHandoffs(app: FastifyInstance, db: Database.Database, recordsLimit: number) {
+export function registerHandoffs(app: FastifyInstance, db: Database.Database, recordsLimit: number, isOwner: (request: FastifyRequest) => boolean, authorizeWriter: WriterAuthorization) {
+  const checkWriter = createWriterGuard(db, isOwner, authorizeWriter);
   app.get<{ Params: { changeId: string } }>('/api/v1/changes/:changeId/handoffs', async (request, reply) => {
     if (!db.prepare('SELECT 1 FROM changes WHERE id = ?').get(request.params.changeId)) return reply.code(404).send({ code: 'NOT_FOUND', message: '变更不存在。', requestId: request.id });
     const rows = db.prepare('SELECT id, cycle, version, phase, content_json AS contentJson, created_at AS createdAt FROM handoff_snapshots WHERE change_id = ? ORDER BY created_at, id').all(request.params.changeId) as { id: string; cycle: number; version: number; phase: string; contentJson: string; createdAt: string }[];
@@ -69,12 +72,15 @@ export function registerHandoffs(app: FastifyInstance, db: Database.Database, re
     return { snapshotId: row.id, markdown, sha256: createHash('sha256').update(markdown, 'utf8').digest('hex') };
   });
 
-  app.post<{ Params: { changeId: string }; Body: { requestId: string } }>('/api/v1/changes/:changeId/handoffs', {
-    schema: { body: { type: 'object', required: ['requestId'], additionalProperties: false, properties: { requestId: { type: 'string', minLength: 1, maxLength: 128 } } } },
+  app.post<{ Params: { changeId: string }; Body: { requestId: string } & WriterGrant }>('/api/v1/changes/:changeId/handoffs', {
+    schema: { body: { type: 'object', required: ['requestId'], additionalProperties: false, properties: { requestId: { type: 'string', minLength: 1, maxLength: 128 }, writerSessionId: { type: 'string', minLength: 1 }, generation: { type: 'integer', minimum: 1 } } } },
   }, async (request, reply) => {
     const { changeId } = request.params;
     const { requestId } = request.body;
-    const fingerprint = JSON.stringify(['create', changeId]);
+    const guard = () => checkWriter(request, request.body, { changeId });
+    const denied = guard();
+    if (denied) return reply.code(denied === 'FORBIDDEN' ? 403 : 409).send({ code: denied, message: writerGrantMessage(denied), requestId: request.id });
+    const fingerprint = JSON.stringify(writerCommand(isOwner(request), request.body, ['create', changeId]));
     const findPrior = () => db.prepare('SELECT fingerprint, snapshot_id AS snapshotId, committed_at AS committedAt FROM handoff_requests WHERE request_id = ?').get(requestId) as { fingerprint: string; snapshotId: string; committedAt: string } | undefined;
     const previous = findPrior();
     if (previous) {
@@ -83,6 +89,8 @@ export function registerHandoffs(app: FastifyInstance, db: Database.Database, re
     }
     if (requestIdUsedElsewhere(db, requestId, 'handoffs')) return reply.code(409).send({ code: 'REQUEST_ID_CONFLICT', message: '请求标识已用于不同的内容。', requestId: request.id });
     const result = db.transaction((): Receipt | string => {
+      const denied = guard();
+      if (denied) return denied;
       const concurrent = findPrior();
       if (concurrent) {
         if (concurrent.fingerprint !== fingerprint) return 'REQUEST_ID_CONFLICT';
@@ -98,7 +106,7 @@ export function registerHandoffs(app: FastifyInstance, db: Database.Database, re
       checkProjectCapacity(db, (db.prepare('SELECT project_id FROM changes WHERE id = ?').get(changeId) as { project_id: string }).project_id, before, recordsLimit);
       return { requestId, resourceId: created.snapshotId, recordVersion: 1, committedAt };
     })();
-    if (typeof result === 'string') return reply.code(result === 'NOT_FOUND' ? 404 : 409).send({ code: result, message: result === 'NOT_FOUND' ? '变更不存在。' : '请求标识已用于不同的内容。', requestId: request.id });
+    if (typeof result === 'string') return reply.code(result === 'NOT_FOUND' ? 404 : result === 'FORBIDDEN' ? 403 : 409).send({ code: result, message: result === 'NOT_FOUND' ? '变更不存在。' : result === 'REQUEST_ID_CONFLICT' ? '请求标识已用于不同的内容。' : writerGrantMessage(result as 'FORBIDDEN' | 'SESSION_EXPIRED' | 'WORKSPACE_CHANGED'), requestId: request.id });
     return reply.code(201).send(result);
   });
 
@@ -118,7 +126,7 @@ export function registerHandoffs(app: FastifyInstance, db: Database.Database, re
     try {
       const identity = await identifyWorkspace(workspace.path);
       if (identity.pathKey !== pathKey(workspace.path) || identity.commonKey !== workspace.commonKey) return reply.code(409).send({ code: 'WORKSPACE_CHANGED', message: '工作目录或仓库身份已变化，请重新绑定。', requestId: request.id });
-      fresh = await observeWorkspace(workspace.path, identity.commonDir, []);
+      fresh = await observeWorkspace(workspace.path, identity.commonDir, saved.files.filter(file => file.status === '??' && file.sha256).map(file => file.path));
     } catch (error) {
       if (error instanceof ObservationTempInsideWorkspace) return reply.code(503).send({ code: 'OBSERVATION_TEMP_INSIDE_WORKSPACE', message: '临时目录位于工作区内，请改用工作区外的临时目录。', requestId: request.id });
       return reply.code(503).send({ code: 'OBSERVATION_FAILED', message: '无法观察工作区，请检查目录和 Git 状态。', requestId: request.id });
@@ -134,12 +142,13 @@ export function registerHandoffs(app: FastifyInstance, db: Database.Database, re
     const headChanged = saved.head !== fresh.head;
     const trackedDiffChanged = saved.trackedDiffSha256 !== null && fresh.trackedDiffSha256 !== null ? saved.trackedDiffSha256 !== fresh.trackedDiffSha256 : null;
     const hasUnsavedChanges = headChanged || trackedDiffChanged === true || added.length > 0 || removed.length > 0 || changed.length > 0;
+    const incomplete = !fresh.stable || trackedDiffChanged === null || saved.files.some(file => file.status === '??' && (!file.sha256 || (freshKeys.has(`${file.status} ${file.path}`) && !freshKeys.get(`${file.status} ${file.path}`)?.sha256)));
     return {
       savedObservation: { id: savedObservation.id, bindingVersion: savedObservation.bindingVersion, createdAt: savedObservation.createdAt, head: saved.head, branch: saved.branch, trackedDiffSha256: saved.trackedDiffSha256 },
       fresh: { head: fresh.head, branch: fresh.branch, dirty: fresh.dirty, stable: fresh.stable, trackedDiffSha256: fresh.trackedDiffSha256, fileCount: fresh.files.length },
       diff: { headChanged, trackedDiffChanged, added, removed, changed },
       hasUnsavedChanges,
-      notice: hasUnsavedChanges ? '检测到比最近保存点更新的文件状态：可能是未保存的新工作。请核对来源，不要自动回滚或覆盖；无法解释的并发改动先停止受影响的写操作。' : '未检测到比最近保存点更新的文件状态。',
+      notice: hasUnsavedChanges ? '检测到比最近保存点更新的文件状态：可能是未保存的新工作。请核对来源，不要自动回滚或覆盖；无法解释的并发改动先停止受影响的写操作。' : incomplete ? '未发现可确认的差异，但部分文件或差异未能核对；请手动检查工作区。' : '未检测到比最近保存点更新的文件状态。',
     };
   });
 }

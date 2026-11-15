@@ -5,7 +5,7 @@ import { dirname, join, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { buildApp } from '../../src/server/app.js';
 
-test('user logs in and sees a saved project after restart', async ({ page }) => {
+test('user logs in and sees a saved project after restart', async ({ page }, testInfo) => {
   const dataDir = await mkdtemp(join(tmpdir(), 'specmill-e2e-'));
   const options = { dataDir, port: 43219, ownerToken: 'test-owner', agentToken: 'test-agent', webDir: resolve('dist') };
   let app = await buildApp(options);
@@ -24,6 +24,34 @@ test('user logs in and sees a saved project after restart', async ({ page }) => 
     await page.getByLabel('本次登录口令').fill('test-owner');
     await page.getByRole('button', { name: '登录' }).click();
     await expect(page.getByText('浏览器测试项目', { exact: true })).toBeVisible();
+    await page.screenshot({ path: testInfo.outputPath('projects-desktop.png'), fullPage: true });
+    await page.setViewportSize({ width: 390, height: 844 });
+    await page.screenshot({ path: testInfo.outputPath('projects-mobile.png'), fullPage: true });
+    expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(390);
+    const longName = '很长的项目名称'.repeat(20);
+    await page.getByLabel('项目名称').fill(longName);
+    await page.getByRole('button', { name: '创建项目' }).click();
+    const openLong = page.getByRole('button', { name: `打开 ${longName}` });
+    await expect(openLong).toBeVisible();
+    expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(390);
+    let releaseWorkspaces = () => {};
+    let reportWorkspaces = () => {};
+    const workspacesGate = new Promise<void>(resolveGate => { releaseWorkspaces = resolveGate; });
+    const workspacesCaptured = new Promise<void>(resolveCaptured => { reportWorkspaces = resolveCaptured; });
+    let capacityRequested = false;
+    await page.route('**/api/v1/projects/*/workspaces', async route => { reportWorkspaces(); await workspacesGate; await route.continue(); });
+    await page.route('**/api/v1/projects/*/capacity', async route => { capacityRequested = true; await route.continue(); });
+    try {
+      await openLong.focus();
+      await page.keyboard.press('Enter');
+      await workspacesCaptured;
+      await expect.poll(() => capacityRequested, { timeout: 3000 }).toBe(true);
+    } finally {
+      releaseWorkspaces();
+      await page.unroute('**/api/v1/projects/*/workspaces');
+      await page.unroute('**/api/v1/projects/*/capacity');
+    }
+    await expect(page.getByRole('heading', { name: longName })).toBeVisible();
   } finally {
     await app.close();
     await rm(dataDir, { recursive: true, force: true });
@@ -135,7 +163,48 @@ test('retry after a lost create response does not create a duplicate', async ({ 
   }
 });
 
-test('user binds a Git workspace and observes uncommitted files', async ({ page }) => {
+test('a delayed workspace list cannot hide a newly bound workspace', async ({ page }) => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'specmill-e2e-workspace-race-'));
+  const repoDir = await mkdtemp(join(tmpdir(), 'specmill-e2e-repo-race-'));
+  const init = spawnSync('git', ['-C', repoDir, 'init', '-q'], { encoding: 'utf8', env: { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: 'NUL' } });
+  if (init.status !== 0) throw new Error(init.stderr);
+  const app = await buildApp({ dataDir, port: 43241, ownerToken: 'test-owner', agentToken: 'test-agent', webDir: resolve('dist') });
+  let release = () => {};
+  let captured = () => {};
+  const gate = new Promise<void>(resolveGate => { release = resolveGate; });
+  const ready = new Promise<void>(resolveReady => { captured = resolveReady; });
+  try {
+    await app.listen({ host: '127.0.0.1', port: 43241 });
+    await page.goto('http://127.0.0.1:43241');
+    await page.getByLabel('本次登录口令').fill('test-owner');
+    await page.getByRole('button', { name: '登录' }).click();
+    await page.getByLabel('项目名称').fill('工作区并发');
+    await page.getByRole('button', { name: '创建项目' }).click();
+    let first = true;
+    await page.route('**/api/v1/projects/*/workspaces', async route => {
+      if (route.request().method() === 'GET' && first) {
+        first = false;
+        const old = await route.fetch(); captured(); await gate;
+        await route.fulfill({ response: old, headers: { ...old.headers(), 'x-test-old-list': 'yes' } });
+      } else await route.continue();
+    });
+    await page.getByRole('button', { name: '打开 工作区并发' }).click();
+    await ready;
+    await page.getByLabel('工作目录').fill(repoDir);
+    await page.getByRole('button', { name: '登记工作区' }).click();
+    await expect(page.getByRole('heading', { name: '已登记工作区' })).toBeVisible();
+    const oldResponse = page.waitForResponse(response => response.headers()['x-test-old-list'] === 'yes');
+    release(); await oldResponse;
+    await page.evaluate(() => new Promise(requestAnimationFrame));
+    await expect(page.getByRole('heading', { name: '已登记工作区' })).toBeVisible();
+  } finally {
+    release(); await page.close(); await app.close();
+    await rm(dataDir, { recursive: true, force: true });
+    await rm(repoDir, { recursive: true, force: true });
+  }
+});
+
+test('user binds a Git workspace and observes uncommitted files', async ({ page }, testInfo) => {
   const dataDir = await mkdtemp(join(tmpdir(), 'specmill-e2e-'));
   const repoDir = await mkdtemp(join(tmpdir(), 'specmill-中文 仓库-'));
   const init = spawnSync('git', ['-C', repoDir, 'init', '-q'], { encoding: 'utf8', env: { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: 'NUL' } });
@@ -144,6 +213,7 @@ test('user binds a Git workspace and observes uncommitted files', async ({ page 
   const app = await buildApp({ dataDir, port: 43223, ownerToken: 'test-owner', agentToken: 'test-agent', webDir: resolve('dist') });
   try {
     await app.listen({ host: '127.0.0.1', port: 43223 });
+    expect((await fetch('http://127.0.0.1:43223/api/v1/project-overviews')).status).toBe(401);
     await page.goto('http://127.0.0.1:43223');
     await page.getByLabel('本次登录口令').fill('test-owner');
     await page.getByRole('button', { name: '登录' }).click();
@@ -158,6 +228,19 @@ test('user binds a Git workspace and observes uncommitted files', async ({ page 
     await expect(page.getByRole('listitem').filter({ hasText: 'unfinished.txt' })).toBeVisible();
     await expect(page.getByText(/9b569cd062350ef2/)).toBeVisible();
     await expect(page.getByText(/忽略文件未覆盖/)).toBeVisible();
+    await page.screenshot({ path: testInfo.outputPath('workspace-desktop.png'), fullPage: true });
+    await page.setViewportSize({ width: 390, height: 844 });
+    await page.screenshot({ path: testInfo.outputPath('workspace-mobile.png'), fullPage: true });
+    expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(390);
+    const nav = page.getByRole('navigation', { name: '项目内容' });
+    const exportLink = nav.getByRole('link', { name: '导出恢复包' });
+    await exportLink.focus();
+    await page.keyboard.press('Enter');
+    await expect(page).toHaveURL(/#project-export$/);
+    await expect(page.getByRole('heading', { name: '导出恢复包' })).toBeInViewport();
+    await nav.getByRole('link', { name: '工作区' }).click();
+    await expect(page).toHaveURL(/#project-workspaces$/);
+    await page.setViewportSize({ width: 1280, height: 720 });
     await writeFile(join(repoDir, 'unfinished.txt'), 'changed');
     await page.getByRole('button', { name: '观察工作区' }).click();
     const history = page.getByLabel('查看历史观察');
@@ -171,10 +254,36 @@ test('user binds a Git workspace and observes uncommitted files', async ({ page 
     await expect(page.getByLabel('查看历史观察').locator('option')).toHaveCount(2);
     await page.getByLabel('查看历史观察').selectOption({ index: 1 });
     await expect(page.getByText(/9b569cd062350ef2/)).toBeVisible();
+    await rm(repoDir, { recursive: true, force: true });
+    await page.getByRole('button', { name: '返回项目列表' }).click();
+    await expect(page.getByText(/目录不存在或不是目录/)).toBeVisible();
+    await page.setViewportSize({ width: 390, height: 844 });
+    await page.screenshot({ path: testInfo.outputPath('project-overview-mobile.png'), fullPage: true });
+    expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(390);
   } finally {
     await app.close();
     await rm(dataDir, { recursive: true, force: true });
     await rm(repoDir, { recursive: true, force: true });
+  }
+});
+
+test('project list remains usable if its overview is unavailable', async ({ page }) => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'specmill-e2e-overview-failure-'));
+  const app = await buildApp({ dataDir, port: 43243, ownerToken: 'test-owner', agentToken: 'test-agent', webDir: resolve('dist') });
+  try {
+    await app.listen({ host: '127.0.0.1', port: 43243 });
+    await page.route('**/api/v1/project-overviews', route => route.fulfill({ status: 503, body: 'unavailable' }));
+    await page.goto('http://127.0.0.1:43243');
+    await page.getByLabel('本次登录口令').fill('test-owner');
+    await page.getByRole('button', { name: '登录' }).click();
+    await page.getByLabel('项目名称').fill('摘要不可用');
+    await page.getByRole('button', { name: '创建项目' }).click();
+    await expect(page.getByText('项目摘要暂不可用。')).toBeVisible();
+    await page.getByRole('button', { name: '打开 摘要不可用' }).click();
+    await expect(page.getByRole('heading', { name: '摘要不可用' })).toBeVisible();
+  } finally {
+    await page.close(); await app.close();
+    await rm(dataDir, { recursive: true, force: true });
   }
 });
 
@@ -225,7 +334,7 @@ test('user confirms a moved repository when no commit can establish its identity
   }
 });
 
-test('user creates, edits, cancels and reopens a change draft', async ({ page }) => {
+test('user creates, edits, cancels and reopens a change draft', async ({ page }, testInfo) => {
   const dataDir = await mkdtemp(join(tmpdir(), 'specmill-e2e-'));
   const app = await buildApp({ dataDir, port: 43226, ownerToken: 'test-owner', agentToken: 'test-agent', webDir: resolve('dist') });
   try {
@@ -243,6 +352,18 @@ test('user creates, edits, cancels and reopens a change draft', async ({ page })
     await create.getByLabel('非目标').fill('多人审批');
     await create.getByLabel('验收条件（每行一项）').fill('可以读取保存点');
     await create.getByRole('button', { name: '创建变更' }).click();
+    const existingHeading = page.getByRole('heading', { name: '续做草案' });
+    await expect(existingHeading).toBeVisible();
+    expect(await existingHeading.evaluate((heading, form) => Boolean(heading.compareDocumentPosition(form) & Node.DOCUMENT_POSITION_FOLLOWING), await create.elementHandle())).toBe(true);
+    const newLink = page.getByRole('link', { name: '新建变更' });
+    await newLink.focus();
+    await page.keyboard.press('Enter');
+    await expect(page).toHaveURL(/#new-change$/);
+    await expect(create).toBeInViewport();
+    await page.setViewportSize({ width: 390, height: 844 });
+    await page.screenshot({ path: testInfo.outputPath('change-mobile.png'), fullPage: true });
+    expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(390);
+    await page.setViewportSize({ width: 1280, height: 720 });
     await page.getByRole('button', { name: '编辑 续做草案' }).click();
     const edit = page.getByRole('form', { name: '编辑变更' });
     await edit.getByRole('textbox', { name: '目标', exact: true }).fill('更新的目标');
@@ -257,7 +378,79 @@ test('user creates, edits, cancels and reopens a change draft', async ({ page })
     await expect(page.getByText(/原因：暂缓/)).toBeVisible();
     await page.getByRole('button', { name: '重新打开 续做草案' }).click();
     await expect(page.getByText(/草案 · 周期 2/)).toBeVisible();
+    await page.getByRole('button', { name: '返回项目列表' }).click();
+    await expect(page.getByText('进行中变更：1')).toBeVisible();
   } finally {
+    await app.close();
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test('change list distinguishes loading from an empty result', async ({ page }) => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'specmill-e2e-loading-'));
+  const app = await buildApp({ dataDir, port: 43239, ownerToken: 'test-owner', agentToken: 'test-agent', webDir: resolve('dist') });
+  let release = () => {};
+  const gate = new Promise<void>(resolveGate => { release = resolveGate; });
+  try {
+    await app.listen({ host: '127.0.0.1', port: 43239 });
+    await page.goto('http://127.0.0.1:43239');
+    await page.getByLabel('本次登录口令').fill('test-owner');
+    await page.getByRole('button', { name: '登录' }).click();
+    await page.getByLabel('项目名称').fill('加载状态');
+    await page.getByRole('button', { name: '创建项目' }).click();
+    await page.route('**/api/v1/projects/*/changes', async route => { if (route.request().method() === 'GET') await gate; await route.continue(); });
+    await page.getByRole('button', { name: '打开 加载状态' }).click();
+    await expect(page.getByText('正在读取变更。')).toBeVisible();
+    await expect(page.getByText('尚无变更。')).toHaveCount(0);
+    release();
+    await expect(page.getByText('尚无变更。')).toBeVisible();
+  } finally {
+    release();
+    await page.close();
+    await app.close();
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test('a delayed initial change list cannot hide a newly created change', async ({ page }) => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'specmill-e2e-stale-list-'));
+  const app = await buildApp({ dataDir, port: 43240, ownerToken: 'test-owner', agentToken: 'test-agent', webDir: resolve('dist') });
+  let release = () => {};
+  let reportCaptured = () => {};
+  const gate = new Promise<void>(resolveGate => { release = resolveGate; });
+  const captured = new Promise<void>(resolveCaptured => { reportCaptured = resolveCaptured; });
+  let first = true;
+  try {
+    await app.listen({ host: '127.0.0.1', port: 43240 });
+    await page.goto('http://127.0.0.1:43240');
+    await page.getByLabel('本次登录口令').fill('test-owner');
+    await page.getByRole('button', { name: '登录' }).click();
+    await page.getByLabel('项目名称').fill('并发读取');
+    await page.getByRole('button', { name: '创建项目' }).click();
+    await page.route('**/api/v1/projects/*/changes', async route => {
+      if (route.request().method() === 'GET' && first) {
+        first = false;
+        const old = await route.fetch();
+        reportCaptured();
+        await gate;
+        await route.fulfill({ response: old, headers: { ...old.headers(), 'x-test-old-list': 'yes' } });
+      } else await route.continue();
+    });
+    await page.getByRole('button', { name: '打开 并发读取' }).click();
+    await captured;
+    const form = page.getByRole('form', { name: '新建变更' });
+    await form.getByLabel('变更标题').fill('新建后仍可见');
+    await form.getByRole('button', { name: '创建变更' }).click();
+    await expect(page.getByRole('heading', { name: '新建后仍可见' })).toBeVisible();
+    const oldResponse = page.waitForResponse(response => response.request().method() === 'GET' && response.headers()['x-test-old-list'] === 'yes');
+    release();
+    await oldResponse;
+    await page.evaluate(() => new Promise(requestAnimationFrame));
+    await expect(page.getByRole('heading', { name: '新建后仍可见' })).toBeVisible();
+    await expect(page.getByText('尚无变更。')).toHaveCount(0);
+  } finally {
+    release();
+    await page.close();
     await app.close();
     await rm(dataDir, { recursive: true, force: true });
   }
@@ -323,7 +516,7 @@ test('user previews Markdown and freezes a baseline', async ({ page }) => {
     await page.close();
     await app.close();
     await rm(dataDir, { recursive: true, force: true });
-    await rm(repoDir, { recursive: true, force: true });
+    await rm(repoDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
   }
 });
 

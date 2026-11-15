@@ -8,10 +8,11 @@ import { buildApp } from '../../src/server/app.js';
 import { encodeSecret } from '../../src/shared/credentials.js';
 
 const runFile = promisify(execFile);
+const testAgentToken = 'c'.repeat(64);
 const dirs: string[] = [];
 const apps: Awaited<ReturnType<typeof buildApp>>[] = [];
 const headers = { host: '127.0.0.1:43227', origin: 'http://127.0.0.1:43227' };
-const agentHeaders = { host: headers.host, authorization: 'Bearer agent-token' };
+const agentHeaders = { host: headers.host, authorization: `Bearer ${testAgentToken}` };
 afterEach(async () => {
   for (const app of apps.splice(0)) await app.close();
   for (const dir of dirs.splice(0)) await rm(dir, { recursive: true, force: true });
@@ -27,7 +28,7 @@ async function setup(maxProjectRecordsBytes?: number) {
   await writeFile(join(repoDir, 'README.md'), '# 示例仓库\n');
   commit(['add', 'README.md']);
   commit(['commit', '-q', '-m', 'init']);
-  const app = await buildApp({ dataDir, port: 43227, ownerToken: 'owner-token', agentToken: 'agent-token', maxProjectRecordsBytes }); apps.push(app);
+  const app = await buildApp({ dataDir, port: 43227, ownerToken: 'owner-token', agentToken: testAgentToken, maxProjectRecordsBytes }); apps.push(app);
   await app.listen({ host: '127.0.0.1', port: 43227 });
   const login = await app.inject({ method: 'POST', url: '/api/v1/session', headers, payload: { token: 'owner-token' } });
   const ownerHeaders = { ...headers, cookie: login.headers['set-cookie'] as string, 'x-specmill-request': '1' };
@@ -47,9 +48,9 @@ async function startSession(app: Awaited<ReturnType<typeof buildApp>>, changeId:
   expect(started.statusCode).toBe(201);
   return started.json() as { resourceId: string; generation: number };
 }
-async function observe(app: Awaited<ReturnType<typeof buildApp>>, workspaceId: string, requestId: string, session: { resourceId: string; generation: number }) {
+async function observe(app: Awaited<ReturnType<typeof buildApp>>, workspaceId: string, requestId: string, session: { resourceId: string; generation: number }, selectedUntracked: string[] = []) {
   const observed = await app.inject({ method: 'POST', url: `/api/v1/workspaces/${workspaceId}/observations`, headers: { ...agentHeaders, 'x-specmill-writer-token': 'a'.repeat(64) },
-    payload: { requestId, expectedBindingVersion: 1, selectedUntracked: [], writerSessionId: session.resourceId, generation: session.generation } });
+    payload: { requestId, expectedBindingVersion: 1, selectedUntracked, writerSessionId: session.resourceId, generation: session.generation } });
   return observed;
 }
 async function saveCheckpoint(app: Awaited<ReturnType<typeof buildApp>>, changeId: string, version: number, requestId: string, observationId: string, session: { resourceId: string; generation: number }) {
@@ -63,6 +64,19 @@ const usedBytes = async (app: Awaited<ReturnType<typeof buildApp>>, projectId: s
 };
 
 describe('fixed handoff snapshots', () => {
+  it('detects content changes to a previously hashed untracked file', async () => {
+    const { app, repoDir, workspaceId, changeId } = await setup();
+    await writeFile(join(repoDir, 'notes.txt'), 'before');
+    const session = await startSession(app, changeId, workspaceId, 'untracked-start');
+    const observation = await observe(app, workspaceId, 'untracked-observe', session, ['notes.txt']);
+    expect(observation.statusCode).toBe(201);
+    expect((await saveCheckpoint(app, changeId, 2, 'untracked-checkpoint', observation.json().resourceId, session)).statusCode).toBe(201);
+    await writeFile(join(repoDir, 'notes.txt'), 'after');
+    const response = await app.inject({ url: `/api/v1/changes/${changeId}/continuation/${workspaceId}`, headers: agentHeaders });
+    expect(response.statusCode).toBe(200);
+    expect(response.json().hasUnsavedChanges).toBe(true);
+    expect(response.json().diff.changed).toContainEqual({ path: 'notes.txt', status: '??' });
+  }, 30000);
   it('captures a fixed snapshot, renders deterministically and counts toward capacity', async () => {
     const { app, projectId, workspaceId, changeId, ownerHeaders } = await setup();
     const session = await startSession(app, changeId, workspaceId, 'm1-start');
@@ -72,7 +86,7 @@ describe('fixed handoff snapshots', () => {
     const saved = await saveCheckpoint(app, changeId, 2, 'm1-checkpoint', observationId, session);
     expect(saved.statusCode).toBe(201);
     const beforeBytes = await usedBytes(app, projectId, ownerHeaders);
-    const created = await app.inject({ method: 'POST', url: `/api/v1/changes/${changeId}/handoffs`, headers: agentHeaders, payload: { requestId: 'm1-snapshot' } });
+    const created = await app.inject({ method: 'POST', url: `/api/v1/changes/${changeId}/handoffs`, headers: ownerHeaders, payload: { requestId: 'm1-snapshot' } });
     expect(created.statusCode).toBe(201);
     const snapshotId = created.json().resourceId as string;
     const afterBytes = await usedBytes(app, projectId, ownerHeaders);
@@ -80,10 +94,10 @@ describe('fixed handoff snapshots', () => {
     // 快照不改写变更版本，重放返回同一快照
     const change = (await app.inject({ url: `/api/v1/changes/${changeId}`, headers: ownerHeaders })).json() as { version: number };
     expect(change.version).toBe(3);
-    const replay = await app.inject({ method: 'POST', url: `/api/v1/changes/${changeId}/handoffs`, headers: agentHeaders, payload: { requestId: 'm1-snapshot' } });
+    const replay = await app.inject({ method: 'POST', url: `/api/v1/changes/${changeId}/handoffs`, headers: ownerHeaders, payload: { requestId: 'm1-snapshot' } });
     expect(replay.json().resourceId).toBe(snapshotId);
     // 新的请求标识产生新的固定快照
-    const second = await app.inject({ method: 'POST', url: `/api/v1/changes/${changeId}/handoffs`, headers: agentHeaders, payload: { requestId: 'm1-snapshot-2' } });
+    const second = await app.inject({ method: 'POST', url: `/api/v1/changes/${changeId}/handoffs`, headers: ownerHeaders, payload: { requestId: 'm1-snapshot-2' } });
     expect(second.statusCode).toBe(201);
     expect(second.json().resourceId).not.toBe(snapshotId);
     // 读取与渲染固定内容
@@ -140,13 +154,19 @@ describe('fixed handoff snapshots', () => {
 
   it('renders through the CLI, refuses to overwrite files and keeps snapshots on output failure', async () => {
     const { app, dataDir, workspaceId, changeId, ownerHeaders } = await setup();
-    await writeFile(join(dataDir, 'cli-token'), await encodeSecret('agent-token'), { mode: 0o600 });
+    await writeFile(join(dataDir, 'cli-token'), await encodeSecret(testAgentToken), { mode: 0o600 });
     const session = await startSession(app, changeId, workspaceId, 'cli-start');
+    const noGrant = await app.inject({ method: 'POST', url: `/api/v1/changes/${changeId}/handoffs`, headers: agentHeaders, payload: { requestId: 'handoff-missing-grant' } });
+    expect(noGrant.json().code).toBe('SESSION_EXPIRED');
+    const wrongToken = await app.inject({ method: 'POST', url: `/api/v1/changes/${changeId}/handoffs`, headers: { ...agentHeaders, 'x-specmill-writer-token': 'b'.repeat(64) }, payload: { requestId: 'handoff-wrong-token', writerSessionId: session.resourceId, generation: session.generation } });
+    expect(wrongToken.statusCode).toBe(403);
     const observed = await observe(app, workspaceId, 'cli-observe', session);
     const observationId = observed.json().resourceId as string;
     expect((await saveCheckpoint(app, changeId, 2, 'cli-checkpoint', observationId, session)).statusCode).toBe(201);
     const cli = (...args: string[]) => runFile(process.execPath, ['--import', 'tsx', resolve('src/cli/main.ts'), ...args, '--data-dir', dataDir, '--server', 'http://127.0.0.1:43227'], { timeout: 20000 });
-    const created = await cli('handoff', 'create', '--change', changeId, '--request-id', 'cli-snapshot', '--json');
+    const grantFile = join(dataDir, 'grant.json');
+    await writeFile(grantFile, await encodeSecret(JSON.stringify({ sessionId: session.resourceId, generation: session.generation, writerToken: 'a'.repeat(64) })));
+    const created = await cli('handoff', 'create', '--change', changeId, '--grant-file', grantFile, '--request-id', 'cli-snapshot', '--json');
     const snapshotId = JSON.parse(created.stdout).resourceId as string;
     expect(snapshotId).toBeTruthy();
     const raw = await cli('handoff', 'show', '--snapshot', snapshotId);
@@ -164,12 +184,13 @@ describe('fixed handoff snapshots', () => {
     expect(refused.code).toBe(6);
     expect(JSON.parse(refused.stderr).code).toBe('OUTPUT_FILE_EXISTS');
     expect((await app.inject({ url: `/api/v1/handoffs/${snapshotId}/render`, headers: ownerHeaders })).statusCode).toBe(200);
-    // 释放会话后（失效授权）工具仍能生成快照：快照不依赖写会话
+    // 释放会话后，旧授权不能生成新快照，历史快照仍可读取
     const release = await app.inject({ method: 'POST', url: `/api/v1/writer-sessions/${session.resourceId}/release`, headers: { ...agentHeaders, 'x-specmill-writer-token': 'a'.repeat(64) },
       payload: { requestId: 'cli-release', expectedVersion: 3, generation: session.generation } });
     expect(release.statusCode).toBe(200);
-    const afterRelease = await cli('handoff', 'create', '--change', changeId, '--request-id', 'cli-snapshot-after-release', '--json');
-    expect(JSON.parse(afterRelease.stdout).resourceId).toBeTruthy();
+    const afterRelease = await cli('handoff', 'create', '--change', changeId, '--grant-file', grantFile, '--request-id', 'cli-snapshot-after-release', '--json').catch((error: { code: number; stderr: string }) => error);
+    expect(JSON.parse(afterRelease.stderr).code).toBe('SESSION_EXPIRED');
+    expect((await app.inject({ url: `/api/v1/handoffs/${snapshotId}/render`, headers: ownerHeaders })).statusCode).toBe(200);
   }, 30000);
 
   it('rejects snapshots beyond capacity while existing snapshots stay readable', async () => {
@@ -178,7 +199,7 @@ describe('fixed handoff snapshots', () => {
     const observed = await observe(app, workspaceId, 'budget-observe', session);
     const observationId = observed.json().resourceId as string;
     expect((await saveCheckpoint(app, changeId, 2, 'budget-checkpoint', observationId, session)).statusCode).toBe(201);
-    const created = await app.inject({ method: 'POST', url: `/api/v1/changes/${changeId}/handoffs`, headers: agentHeaders, payload: { requestId: 'budget-snapshot' } });
+    const created = await app.inject({ method: 'POST', url: `/api/v1/changes/${changeId}/handoffs`, headers: ownerHeaders, payload: { requestId: 'budget-snapshot' } });
     expect(created.statusCode).toBe(201);
     const snapshotId = created.json().resourceId as string;
     const capacity = async () => (await app.inject({ url: `/api/v1/projects/${projectId}/capacity`, headers: ownerHeaders })).json().records as { used: number; limit: number };
@@ -192,7 +213,7 @@ describe('fixed handoff snapshots', () => {
     await app.inject({ method: 'POST', url: `/api/v1/projects/${projectId}/changes`, headers: ownerHeaders,
       payload: { requestId: 'budget-fill-1', expectedVersion: null, payload: { title: '填充', goal: 'x'.repeat(Math.max(0, Math.floor((beforeTakeoverBytes - 100 - perFill) / 2))), scope: '', nonGoals: '', criteria: [] } } });
     expect(await remaining()).toBeLessThan(110);
-    const rejected = await app.inject({ method: 'POST', url: `/api/v1/changes/${changeId}/handoffs`, headers: agentHeaders, payload: { requestId: 'budget-snapshot-2' } });
+    const rejected = await app.inject({ method: 'POST', url: `/api/v1/changes/${changeId}/handoffs`, headers: ownerHeaders, payload: { requestId: 'budget-snapshot-2' } });
     expect(rejected.statusCode).toBe(413);
     expect(rejected.json().code).toBe('PROJECT_CAPACITY_EXCEEDED');
     // 超限拒绝不影响既有保存点与快照的读取和渲染

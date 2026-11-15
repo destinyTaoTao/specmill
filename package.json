@@ -24,7 +24,7 @@
     "verify:package": "node scripts/verify-package.mjs",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
-    "test": "vitest run",
+    "test": "vitest run --maxWorkers=2",
     "test:e2e": "playwright test"
   },
   "dependencies": {

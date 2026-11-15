@@ -216,7 +216,7 @@ export function CheckpointPanel({ change, active, sessionReady, refresh }: { cha
     } catch { setError('无法确认保存结果，请稍后查询或按原请求重试。'); } finally { setBusy(false); }
   }
   return <section><h5>续做保存点</h5>{error && <p role="alert">{error}</p>}
-    {notice && <p>{notice}</p>}
+    <p role="status">{notice}</p>
     <p>保存工作台记录不等于备份源码或完成验收。</p>
     {history === null ? <p>正在读取保存点。</p> : history.length === 0 ? <p>尚无保存点，可在关键节点记录进度。</p> : <details><summary>保存点历史（{history.length}）</summary>{history.map(item => <article key={item.id}><p>{item.createdAt} · {item.actor === 'user' ? '用户' : '工具'} · {item.baselineId ? `冻结基线 ${item.baselineId}` : `未确认草案修订 ${item.draftRevisionId}`}</p><p>观察：{item.observationCreatedAt} · {item.observationPath} · 绑定版本 {item.observationBindingVersion} · {item.observationId} {item.observationStable ? '' : '（观察不稳定）'}</p><ul>{item.observationLimitations.map((value, index) => <li key={index}>{value}</li>)}</ul><p>目标：{item.goal.trim() ? item.goal : '尚未填写'}</p><p>已完成：{item.done}</p><p>失败：{item.failures}</p><p>未验证：{item.unverified}</p><p>阻塞：{item.blockers}</p><p>下一步：{item.nextSteps}</p></article>)}</details>}
     {!context && <button disabled={!active || !sessionReady || needsReload || !!pending} onClick={begin}>填写保存点</button>}
