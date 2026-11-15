@@ -1,3 +1,4 @@
+#!/usr/bin/env node
 import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { createReadStream } from 'node:fs';
 import { randomBytes, randomUUID } from 'node:crypto';

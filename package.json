@@ -6,11 +6,22 @@
   "engines": {
     "node": ">=24.22.3 <25"
   },
+  "bin": {
+    "specmill": "dist-server/server/main.js",
+    "specmill-cli": "dist-cli/cli/main.js"
+  },
+  "files": [
+    "dist",
+    "dist-server",
+    "dist-cli",
+    "README.md"
+  ],
   "scripts": {
     "dev": "npm run build && npm run start",
     "start": "node dist-server/server/main.js",
     "cli": "node dist-cli/cli/main.js",
     "build": "tsc --noEmit && tsc -p tsconfig.server.json && tsc -p tsconfig.cli.json && vite build",
+    "verify:package": "node scripts/verify-package.mjs",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
     "test": "vitest run",

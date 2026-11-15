@@ -1,7 +1,9 @@
+#!/usr/bin/env node
 import { randomBytes, randomUUID } from 'node:crypto';
-import { join, resolve } from 'node:path';
+import { join, resolve, dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { rename, rm, writeFile } from 'node:fs/promises';
+import { fileURLToPath } from 'node:url';
 import { buildApp } from './app.js';
 import { encodeSecret } from '../shared/credentials.js';
 
@@ -15,9 +17,11 @@ function option(name: string, fallback: string) {
 const port = Number(option('--port', '43127'));
 if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('Invalid port');
 const dataDir = resolve(option('--data-dir', join(process.env.LOCALAPPDATA ?? join(homedir(), '.local', 'share'), 'SpecMill')));
+// 静态页面相对包根解析：安装为全局包后从任意工作目录启动仍然有效。
+const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 const ownerToken = randomBytes(32).toString('hex');
 const agentToken = randomBytes(32).toString('hex');
-const app = await buildApp({ dataDir, port, ownerToken, agentToken, webDir: resolve('dist') });
+const app = await buildApp({ dataDir, port, ownerToken, agentToken, webDir: join(packageRoot, 'dist') });
 try {
   const temporary = join(dataDir, `cli-token-${randomUUID()}.tmp`);
   try {
