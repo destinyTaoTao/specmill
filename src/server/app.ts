@@ -15,10 +15,11 @@ import { registerEvidence } from './features/evidence.js';
 import { registerReview } from './features/review.js';
 import { registerRecovery } from './features/recovery.js';
 import { registerProjectOverviews } from './features/project-overviews.js';
+import { registerPilot, type PilotOptions } from './pilot/routes.js';
 import { checkProjectCapacity, DEFAULT_RECORDS_LIMIT, ProjectCapacityExceeded } from './storage/project-capacity.js';
 import { requestIdUsedElsewhere } from './storage/request-ids.js';
 
-export type AppOptions = { dataDir: string; port: number; ownerToken: string; agentToken: string; webDir?: string; allowedOrigin?: string; maxProjectRecordsBytes?: number };
+export type AppOptions = { dataDir: string; port: number; ownerToken: string; agentToken: string; webDir?: string; allowedOrigin?: string; maxProjectRecordsBytes?: number; pilot?: PilotOptions };
 export type Receipt = { requestId: string; resourceId: string; recordVersion: number; committedAt: string };
 function equal(a: string, b: string): boolean {
   const x = Buffer.from(a), y = Buffer.from(b);
@@ -308,6 +309,7 @@ export async function buildApp(options: AppOptions) {
       const bearer = request.headers.authorization?.replace(/^Bearer /, '') ?? '';
       const agent = !!bearer && equal(bearer, options.agentToken);
       if (!owner && !agent) return sendError(request, reply, 401, 'UNAUTHORIZED', '请先登录工作台。');
+      if (route.startsWith('/api/v1/pilot/') && !owner) return sendError(request, reply, 403, 'FORBIDDEN', '试点工作流需要本机用户登录。');
       if (request.method !== 'GET') {
         const agentRoute = request.method === 'POST' && (route === '/api/v1/changes/:changeId/writer-sessions' || route === '/api/v1/writer-sessions/:sessionId/release' || route === '/api/v1/changes/:changeId/checkpoints' || route === '/api/v1/workspaces/:workspaceId/observations' || route === '/api/v1/changes/:changeId/handoffs' || route === '/api/v1/changes/:changeId/executions' || route === '/api/v1/changes/:changeId/evidence' || route === '/api/v1/changes/:changeId/acceptance-targets' || route === '/api/v1/changes/:changeId/acceptance-proposals' || route === '/api/v1/projects/:projectId/attachments' || route === '/api/v1/projects/:projectId/exports' || route === '/api/v1/changes/:changeId/review/preview' || route === '/api/v1/changes/:changeId/review/failure-dispositions/preview');
         if (owner ? !requestOrigin || request.headers['x-specmill-request'] !== '1' : !agent || !agentRoute) return sendError(request, reply, 403, 'FORBIDDEN', '没有执行此操作的权限。');
@@ -369,6 +371,7 @@ export async function buildApp(options: AppOptions) {
     app.setNotFoundHandler((request, reply) => sendError(request, reply, 404, 'NOT_FOUND', '请求的资源不存在。'));
     if (options.webDir) await app.register(fastifyStatic, { root: resolve(options.webDir), prefix: '/' });
     app.addHook('onClose', async () => { db!.close(); await unlock(); });
+    if (options.pilot) await registerPilot(app, dir, options.pilot);
     return app;
   } catch (error) {
     db?.close(); await unlock(); throw error;

@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, type FormEvent } from 'react';
 import { createRoot } from 'react-dom/client';
 import { ApiError, readJson, responseError } from './api';
 import { ChangeDrafts } from './ChangeDrafts';
+import { PilotPanel } from './PilotPanel';
 import './styles.css';
 
 type Project = { id: string; name: string; createdAt: string };
@@ -337,7 +338,7 @@ function App() {
           <div className="restore-area"><label>从恢复包恢复（.zip，仅恢复记录与附件，不含源码）<input type="file" accept=".zip" disabled={busy || restoring} onChange={event => { const file = event.target.files?.[0]; event.target.value = ''; if (file) void restorePackage(file); }} /></label></div>
           <p role="status">{restoreNotice}</p>
         </section>
-      </div></>}
+      </div><PilotPanel /></>}
   </main>;
 }
 createRoot(document.getElementById('root')!).render(<App />);

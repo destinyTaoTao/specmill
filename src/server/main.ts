@@ -21,7 +21,8 @@ const dataDir = resolve(option('--data-dir', join(process.env.LOCALAPPDATA ?? jo
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 const ownerToken = randomBytes(32).toString('hex');
 const agentToken = randomBytes(32).toString('hex');
-const app = await buildApp({ dataDir, port, ownerToken, agentToken, webDir: join(packageRoot, 'dist') });
+const agentBin = option('--pilot-agent', '');
+const app = await buildApp({ dataDir, port, ownerToken, agentToken, webDir: join(packageRoot, 'dist'), pilot: agentBin ? { agentBin } : undefined });
 try {
   const temporary = join(dataDir, `cli-token-${randomUUID()}.tmp`);
   try {
