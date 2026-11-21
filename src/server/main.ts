@@ -22,7 +22,9 @@ const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..')
 const ownerToken = randomBytes(32).toString('hex');
 const agentToken = randomBytes(32).toString('hex');
 const agentBin = option('--pilot-agent', '');
-const app = await buildApp({ dataDir, port, ownerToken, agentToken, webDir: join(packageRoot, 'dist'), pilot: agentBin ? { agentBin } : undefined });
+const teamAgent = option('--team-agent', '');
+const app = await buildApp({ dataDir, port, ownerToken, agentToken, webDir: join(packageRoot, 'dist'),
+  pilot: agentBin ? { agentBin } : undefined, team: teamAgent ? { agentBin: teamAgent } : undefined });
 try {
   const temporary = join(dataDir, `cli-token-${randomUUID()}.tmp`);
   try {
@@ -31,4 +33,5 @@ try {
   } finally { await rm(temporary, { force: true }); }
   await app.listen({ host: '127.0.0.1', port });
   console.log(`SpecMill: http://127.0.0.1:${port}\n本次登录口令：${ownerToken}\n数据目录：${dataDir}`);
+  if (teamAgent) console.log(`团队工作流入口：http://127.0.0.1:${port}/?team`);
 } catch (error) { await app.close(); throw error; }

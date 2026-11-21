@@ -92,10 +92,11 @@ export function checkPilotSql(sql: string): PilotResult['checks'] {
 
 const runFile = promisify(execFile);
 const gitNull = process.platform === 'win32' ? 'NUL' : '/dev/null';
-async function git(repo: string, ...args: string[]) {
+export async function runSampleGit(repo: string, args: string[], commitDate?: string) {
   const env = {
     PATH: process.env.PATH, SystemRoot: process.env.SystemRoot, GIT_CONFIG_NOSYSTEM: '1',
     GIT_CONFIG_GLOBAL: gitNull, GIT_ATTR_NOSYSTEM: '1', GIT_TERMINAL_PROMPT: '0', HOME: repo, XDG_CONFIG_HOME: repo,
+    ...(commitDate ? { GIT_AUTHOR_DATE: commitDate, GIT_COMMITTER_DATE: commitDate } : {}),
   };
   return (await runFile('git', [
     '-c', 'core.hooksPath=' + gitNull, '-c', 'commit.gpgSign=false', '-c', 'core.autocrlf=false',
@@ -103,7 +104,11 @@ async function git(repo: string, ...args: string[]) {
   ], { cwd: repo, env, windowsHide: true, timeout: 8000, maxBuffer: 16384 })).stdout;
 }
 
-export async function createPilotRepo(job: PilotJob) {
+function git(repo: string, ...args: string[]) {
+  return runSampleGit(repo, args);
+}
+
+export async function createPilotRepo(job: Pick<PilotJob, 'root' | 'attemptId'>) {
   if (!isAbsolute(job.root) || !/^[a-zA-Z0-9_-]{1,80}$/.test(job.attemptId)) throw new Error('样例工作目录无效。');
   await mkdir(job.root, { recursive: true, mode: 0o700 });
   const root = await realpath(job.root);

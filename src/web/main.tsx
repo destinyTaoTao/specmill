@@ -3,6 +3,7 @@ import { createRoot } from 'react-dom/client';
 import { ApiError, readJson, responseError } from './api';
 import { ChangeDrafts } from './ChangeDrafts';
 import { PilotPanel } from './PilotPanel';
+import { TeamApp } from './TeamApp';
 import './styles.css';
 
 type Project = { id: string; name: string; createdAt: string };
@@ -341,4 +342,4 @@ function App() {
       </div><PilotPanel /></>}
   </main>;
 }
-createRoot(document.getElementById('root')!).render(<App />);
+createRoot(document.getElementById('root')!).render(new URLSearchParams(location.search).has('team') ? <TeamApp /> : <App />);
