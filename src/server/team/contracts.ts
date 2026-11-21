@@ -1,4 +1,5 @@
 import type { PILOT_SPEC, PilotResult } from '../pilot/sample.js';
+import type { AgentEvidence } from '../workflow/executor.js';
 
 export type Role = 'developer' | 'reviewer' | 'both';
 export type Task = 'dates' | 'paid' | 'integrate';
@@ -15,6 +16,7 @@ export interface TaskArtifact {
   generation: number;
   commit: string;
   content: string;
+  agent?: AgentEvidence;
 }
 export interface TeamIntegration {
   commit: string;

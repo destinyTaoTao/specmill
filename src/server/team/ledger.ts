@@ -1,6 +1,7 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import Database from 'better-sqlite3';
 import { checkPilotSql, PILOT_SPEC } from '../pilot/sample.js';
+import { readAgentEvidence } from '../workflow/executor.js';
 import { assemble, extractPredicate } from './workspace.js';
 import type { Role, Task, TaskArtifact, TeamAdmin, TeamAttempt, TeamClaim, TeamDetail,
   TeamEvent, TeamIntegration, TeamMember, TeamProject, TeamResult, TeamSummary } from './contracts.js';
@@ -54,8 +55,10 @@ function readResult(claim: TeamClaim, input: unknown): TeamResult | null {
     try {
       if (extractPredicate(claim.task, a.content) !== a.content) return null;
     } catch { return null; }
+    const agent = readAgentEvidence(a.agent);
+    if (a.agent !== undefined && !agent) return null;
     return {kind: 'task', artifact: {task: claim.task, attemptId: claim.attemptId, generation: claim.generation,
-      commit: a.commit, content: a.content}};
+      commit: a.commit, content: a.content, ...(agent ? {agent} : {})}};
   }
   if (input.kind !== 'integration' || claim.task !== 'integrate') return null;
   const i = input.integration;
@@ -108,6 +111,10 @@ export class TeamLedger {
           id TEXT PRIMARY KEY,runId TEXT NOT NULL,task TEXT NOT NULL,generation INTEGER NOT NULL,startedAt TEXT NOT NULL,
           finishedAt TEXT,status TEXT NOT NULL,reason TEXT NOT NULL DEFAULT '',resultJson TEXT,
           FOREIGN KEY(runId,task) REFERENCES tasks(runId,task),UNIQUE(runId,task,generation));
+        CREATE INDEX IF NOT EXISTS team_live_runs ON runs(projectId,id) WHERE status IN ('queued','running');
+        CREATE INDEX IF NOT EXISTS team_queued_tasks ON tasks(runId) WHERE status='queued';
+        CREATE INDEX IF NOT EXISTS team_running_tasks ON tasks(runId) WHERE status='running';
+        CREATE INDEX IF NOT EXISTS team_running_attempts ON attempts(runId) WHERE status='running';
         CREATE TABLE IF NOT EXISTS events (
           id INTEGER PRIMARY KEY,projectId TEXT,runId TEXT,version INTEGER,at TEXT NOT NULL,actor TEXT NOT NULL,
           action TEXT NOT NULL,reason TEXT NOT NULL,requestId TEXT,attemptId TEXT);
@@ -331,7 +338,9 @@ export class TeamLedger {
   }
 
   private activeClaims(expiredOnly: boolean): TeamClaim[] {
-    return this.db.prepare(`SELECT r.projectId,a.runId,a.id AS attemptId,a.task,a.generation FROM attempts a JOIN runs r ON r.id=a.runId
+    // A rowid scan satisfies the ordering but reads all historical attempts. Read the bounded active set first.
+    return this.db.prepare(`SELECT r.projectId,a.runId,a.id AS attemptId,a.task,a.generation
+      FROM attempts a INDEXED BY team_running_attempts JOIN runs r ON r.id=a.runId
       WHERE a.status='running' ${expiredOnly ? 'AND NOT (' + activeLease + ')' : ''} ORDER BY a.rowid`).all() as TeamClaim[];
   }
   private blockUnsupportedRuns() {
@@ -353,7 +362,7 @@ export class TeamLedger {
         JOIN projects p ON p.id=r.projectId JOIN grants g ON g.projectId=p.id AND g.memberId=r.implementerId
         WHERE t.status='queued' AND r.status IN ('queued','running') AND g.role IN ('developer','both') AND r.specJson=?
         AND (SELECT count(*) FROM runs other JOIN tasks active ON active.runId=other.id
-          WHERE other.projectId=p.id AND active.status='running')<2
+          WHERE other.projectId=p.id AND other.status IN ('queued','running') AND active.status='running')<2
         ORDER BY p.lastClaim,r.rowid,t.rowid LIMIT 1`).get(supportedSpec) as Omit<TeamClaim,'attemptId'> | undefined;
       if (!row) return null;
       const c: TeamClaim = {...row, generation: row.generation + 1, attemptId: randomUUID()};

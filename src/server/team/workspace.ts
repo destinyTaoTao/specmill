@@ -29,7 +29,8 @@ export function extractPredicate(task: CodeTask, output: string): string {
     throw new Error('谓词超出固定合成样例范围。');
   }
   const value = output.trim();
-  const unwrapped = /^```(?:sql)?[ \t]*\r?\n([\s\S]*?)\r?\n```$/i.exec(value)?.[1] ?? value;
+  const unwrapped = /^```(?:sql)?[ \t]*\r?\n([\s\S]*?)\r?\n```$/i.exec(value)?.[1]
+    ?? /^`([^`\r\n]+)`$/.exec(value)?.[1] ?? value;
   const predicate = unwrapped.trim().replace(/;$/, '').trimEnd().replace(/\s+/g, ' ');
   if (!predicateGrammar[task].test(predicate) ||
       (predicate.match(/:\w+/g) ?? []).some(key => key !== ':start_date' && key !== ':end_date')) {

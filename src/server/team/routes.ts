@@ -1,8 +1,8 @@
-import { mkdir, stat } from 'node:fs/promises';
-import { isAbsolute, join } from 'node:path';
+import { mkdir } from 'node:fs/promises';
+import { join } from 'node:path';
 import type { FastifyError, FastifyInstance, FastifyRequest } from 'fastify';
 import { PILOT_SPEC } from '../pilot/sample.js';
-import type { PilotOptions } from '../pilot/routes.js';
+import { isExecutor, isExecutorEntry, isModel, type ExecutorId } from '../workflow/executor.js';
 import { WorkflowSupervisor } from '../workflow/supervisor.js';
 import { TEAM_SPEC_HASH, TeamError, TeamLedger } from './ledger.js';
 import { verifyIntegration } from './verify.js';
@@ -17,27 +17,37 @@ const object = (properties: Record<string, unknown>) => ({
   type: 'object', properties, required: Object.keys(properties), additionalProperties: false,
 });
 const named = { schema: { body: object({ name: string(80) }) } };
+export type TeamOptions = { agentBin: string; workerModule?: URL; executor?: ExecutorId; model?: string; workers?: number };
 
-export async function registerTeam(app: FastifyInstance, dataDir: string, options: PilotOptions) {
-  if (!isAbsolute(options.agentBin) || !(await stat(options.agentBin).catch(() => null))?.isFile() ||
-      (process.platform === 'win32' && !options.agentBin.toLowerCase().endsWith('.exe'))) {
-    throw new Error('--team-agent 需要 Codex 原生可执行文件的绝对路径。');
+export async function registerTeam(app: FastifyInstance, dataDir: string, options: TeamOptions) {
+  const executor = options.executor ?? 'codex';
+  const workers = options.workers ?? 2;
+  if (!isExecutor(executor) || !await isExecutorEntry(executor, options.agentBin)) {
+    throw new Error('--team-agent 需要 Codex 可执行文件或 Pi JavaScript 入口的绝对路径。');
   }
+  if (executor === 'pi' ? !isModel(options.model) : options.model !== undefined) {
+    throw new Error('--team-model 仅用于 Pi，格式为 provider/model。');
+  }
+  if (!Number.isInteger(workers) || workers < 1 || workers > 8) throw new Error('--team-workers 必须是 1 至 8 的整数。');
   const root = join(dataDir, 'team');
   const workspaceRoot = join(root, 'workspaces');
   await mkdir(workspaceRoot, { recursive: true, mode: 0o700 });
   app.register(async scope => {
     const ledger = new TeamLedger(join(root, 'team.sqlite'));
-    const supervisor = new WorkflowSupervisor<TeamClaim, TeamResult>(ledger, 2, workspaceRoot, options.agentBin,
+    const supervisor = new WorkflowSupervisor<TeamClaim, TeamResult>(ledger, workers, workspaceRoot, options.agentBin,
       options.workerModule ?? new URL('./worker.js', import.meta.url),
       () => scope.log.error('团队工作流调度暂时失败，将重试。'),
       async (claim, result) => {
+        if (!options.workerModule && claim.task !== 'integrate' && result?.kind === 'task' &&
+            result.artifact?.agent?.executor !== executor) {
+          return { kind: 'failure', error: 'Worker 的执行器证据与服务配置不符。' };
+        }
         if (claim.task === 'integrate' && result?.kind === 'integration' &&
             !(await verifyIntegration(claim, result.integration))) {
           return { kind: 'failure', error: '服务端无法独立重建集成提交并复核证据。' };
         }
         return result;
-      });
+      }, { executor, model: options.model });
     scope.addHook('onReady', async () => supervisor.start());
     scope.addHook('onClose', async () => { try { await supervisor.stop(); } finally { ledger.close(); } });
     scope.addHook('onRequest', async (_request, reply) => { reply.header('Cache-Control', 'no-store'); });

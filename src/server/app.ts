@@ -16,11 +16,11 @@ import { registerReview } from './features/review.js';
 import { registerRecovery } from './features/recovery.js';
 import { registerProjectOverviews } from './features/project-overviews.js';
 import { registerPilot, type PilotOptions } from './pilot/routes.js';
-import { registerTeam } from './team/routes.js';
+import { registerTeam, type TeamOptions } from './team/routes.js';
 import { checkProjectCapacity, DEFAULT_RECORDS_LIMIT, ProjectCapacityExceeded } from './storage/project-capacity.js';
 import { requestIdUsedElsewhere } from './storage/request-ids.js';
 
-export type AppOptions = { dataDir: string; port: number; ownerToken: string; agentToken: string; webDir?: string; allowedOrigin?: string; maxProjectRecordsBytes?: number; pilot?: PilotOptions; team?: PilotOptions };
+export type AppOptions = { dataDir: string; port: number; ownerToken: string; agentToken: string; webDir?: string; allowedOrigin?: string; maxProjectRecordsBytes?: number; pilot?: PilotOptions; team?: TeamOptions };
 export type Receipt = { requestId: string; resourceId: string; recordVersion: number; committedAt: string };
 function equal(a: string, b: string): boolean {
   const x = Buffer.from(a), y = Buffer.from(b);

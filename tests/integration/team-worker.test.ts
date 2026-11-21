@@ -76,8 +76,10 @@ async function codeTask(root: string, preload: string, task: TaskArtifact['task'
 describe('team execution on a frozen synthetic order query', () => {
   it('restricts each agent to the bounded predicate for its own task', () => {
     expect(extractPredicate('paid', "```sql\nstatus = 'paid';\n```")).toBe("status = 'paid'");
+    expect(extractPredicate('dates', '`order_date BETWEEN :start_date AND :end_date`'))
+      .toBe('order_date BETWEEN :start_date AND :end_date');
     for (const output of ["status = 'paid'", 'order_date < :START_DATE', 'order_date = :end_date -- comment',
-      'SELECT id FROM orders', 'order_date = :end_date; SELECT 1', ' '.repeat(513)]) {
+      'SELECT id FROM orders', 'order_date = :end_date; SELECT 1', '`order_date = :end_date; SELECT 1`', ' '.repeat(513)]) {
       expect(() => extractPredicate('dates', output)).toThrow();
     }
     expect(() => extractPredicate('paid', "status = 'refunded'")).toThrow();

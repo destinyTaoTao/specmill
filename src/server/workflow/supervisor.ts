@@ -1,4 +1,5 @@
 import { fork, type ChildProcess } from 'node:child_process';
+import type { ExecutorId } from './executor.js';
 
 interface Queue<C, R> {
   claim(): C | null;
@@ -24,7 +25,8 @@ export class WorkflowSupervisor<C extends { attemptId: string }, R> {
 
   constructor(private queue: Queue<C, R>, private capacity: number, private root: string, private agentBin: string,
     private module: URL, private reportError: () => void,
-    private verify?: (claim: C, result: R) => Promise<R>) {}
+    private verify?: (claim: C, result: R) => Promise<R>,
+    private executor?: { executor: ExecutorId; model?: string }) {}
 
   start() {
     this.queue.recover();
@@ -71,6 +73,9 @@ export class WorkflowSupervisor<C extends { attemptId: string }, R> {
     for (const key of ['PATH', 'SystemRoot', 'HOME', 'USERPROFILE', 'APPDATA', 'LOCALAPPDATA',
       'TEMP', 'TMP', 'TMPDIR', 'CODEX_HOME', 'LANG', 'HTTPS_PROXY', 'HTTP_PROXY', 'ALL_PROXY', 'NO_PROXY']) {
       if (process.env[key]) env[key] = process.env[key];
+    }
+    if (this.executor?.executor === 'pi' && this.executor.model?.startsWith('deepseek/') && process.env.DEEPSEEK_API_KEY) {
+      env.DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY;
     }
     const child = fork(this.module, [], { cwd: this.root, execArgv: [], env, stdio: ['ignore', 'ignore', 'ignore', 'ipc'] });
     let settled = false;
@@ -121,7 +126,7 @@ export class WorkflowSupervisor<C extends { attemptId: string }, R> {
         } catch { this.reportError(); }
       })();
     });
-    child.send({ ...claim, root: this.root, agentBin: this.agentBin }, error => {
+    child.send({ ...claim, root: this.root, agentBin: this.agentBin, ...this.executor }, error => {
       if (error && this.slots.has(claim.attemptId)) stop('Worker 未能领取任务。');
     });
   }

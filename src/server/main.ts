@@ -5,6 +5,7 @@ import { homedir } from 'node:os';
 import { rename, rm, writeFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { buildApp } from './app.js';
+import { isExecutor } from './workflow/executor.js';
 import { encodeSecret } from '../shared/credentials.js';
 
 const args = process.argv.slice(2);
@@ -23,8 +24,15 @@ const ownerToken = randomBytes(32).toString('hex');
 const agentToken = randomBytes(32).toString('hex');
 const agentBin = option('--pilot-agent', '');
 const teamAgent = option('--team-agent', '');
+const executor = option('--team-executor', 'codex');
+const model = option('--team-model', '') || undefined;
+const workers = Number(option('--team-workers', '2'));
+if (!isExecutor(executor)) throw new Error('--team-executor must be codex or pi');
+if (!teamAgent && ['--team-executor', '--team-model', '--team-workers'].some(flag => args.includes(flag))) {
+  throw new Error('Team configuration requires --team-agent');
+}
 const app = await buildApp({ dataDir, port, ownerToken, agentToken, webDir: join(packageRoot, 'dist'),
-  pilot: agentBin ? { agentBin } : undefined, team: teamAgent ? { agentBin: teamAgent } : undefined });
+  pilot: agentBin ? { agentBin } : undefined, team: teamAgent ? { agentBin: teamAgent, executor, model, workers } : undefined });
 try {
   const temporary = join(dataDir, `cli-token-${randomUUID()}.tmp`);
   try {
