@@ -28,16 +28,25 @@ const metrics = {};
 const errors = {};
 const loop = monitorEventLoopDelay({ resolution: 10 });
 const content = { dates: 'order_date BETWEEN :start_date AND :end_date', paid: "status = 'paid'" };
+const measuredOperations = ['query', 'claim', 'leaseCheck', 'submit'];
+const operationCount = () => measuredOperations.reduce((sum, name) => sum + (metrics[name]?.length ?? 0), 0);
 let finishedRuns = 0;
 let idleClaims = 0;
 let transactionBusy = 0;
 let maxQueued = 0;
+let measurementStart;
+const operationsByMinute = [];
 
 function measure(name, fn) {
   const start = performance.now();
   try {
     const result = fn();
-    (metrics[name] ??= []).push(performance.now() - start);
+    const finished = performance.now();
+    (metrics[name] ??= []).push(finished - start);
+    if (measuredOperations.includes(name)) {
+      const minute = Math.floor((finished - measurementStart) / 60_000);
+      operationsByMinute[minute] = (operationsByMinute[minute] ?? 0) + 1;
+    }
     return result;
   } catch (error) {
     if (error.code?.startsWith('SQLITE_BUSY')) transactionBusy++;
@@ -99,7 +108,7 @@ try {
   }
   maxQueued = queued.size;
   const initialBytes = (await stat(filename)).size;
-  const begin = performance.now();
+  const begin = measurementStart = performance.now();
   loop.enable();
   let rounds = 0;
   let error;
@@ -141,13 +150,15 @@ try {
   loop.disable();
   const sizes = await Promise.all([filename, filename + '-wal'].map(path => stat(path).then(s => s.size)));
   const operations = Object.fromEntries(Object.entries(metrics).map(([name, times]) => [name, summarize(times)]));
-  const count = ['query', 'claim', 'leaseCheck', 'submit'].reduce((sum, name) => sum + (metrics[name]?.length ?? 0), 0);
+  const count = operationCount();
   console.log(JSON.stringify({
     machine: { platform: platform(), cpu: cpus()[0]?.model, effectiveCpu: availableParallelism(),
       totalMem: totalmem(), node: process.version },
     config: { seconds, roundsPerSecond, historicalRuns, clients: 100, projects: 10, initialRunsInFlight: 80 },
     cache: 'Warm process and SQLite connection after seeding, OS cache uncontrolled',
     elapsed, rounds, opsPerSecond: count / elapsed, runsPerSecond: finishedRuns / elapsed, operations,
+    fullMinuteOpsPerSecond: Array.from({ length: Math.floor(Math.min(seconds, elapsed) / 60) }, (_, minute) =>
+      (operationsByMinute[minute] ?? 0) / 60),
     queueFirstClaimMs: summarize(queueDelay), maxRunsInFlight: maxQueued, idleClaims, transactionBusy, errors,
     eventLoopP99Ms: loop.percentile(99) / 1e6, initialBytes, finalDbBytes: sizes[0], finalWalBytes: sizes[1],
     projects: Object.values(byProject), modelCostUsd: 0,

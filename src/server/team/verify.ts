@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import type { TeamClaim, TeamIntegration } from './contracts.js';
-import { createTeamWorkspace, integrateTasks, validScope } from './workspace.js';
+import { replayIntegration, validScope } from './workspace.js';
 
 export async function verifyIntegration(claim: TeamClaim, result: TeamIntegration): Promise<boolean> {
   try {
@@ -11,8 +11,7 @@ export async function verifyIntegration(claim: TeamClaim, result: TeamIntegratio
     const base = await realpath(tmpdir());
     const scratch = await mkdtemp(join(base, 'specmill-team-proof-'));
     try {
-      const workspace = await createTeamWorkspace(scratch, claim);
-      const reproduced = await integrateTasks(workspace, claim, claim.inputs);
+      const reproduced = await replayIntegration(scratch, claim, claim.inputs);
       return isDeepStrictEqual(result, reproduced);
     } finally {
       const actual = await realpath(scratch);

@@ -1,12 +1,14 @@
 import { randomUUID } from 'node:crypto';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { availableParallelism, cpus, tmpdir, totalmem } from 'node:os';
 import { join } from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { setTimeout as sleep } from 'node:timers/promises';
+import { isDeepStrictEqual } from 'node:util';
 import { buildApp } from '../dist-server/server/app.js';
 
-const [workers = 2, perProject = 3, port = 43139, seconds = 0] = process.argv.slice(2).map(Number);
+const [workers = 2, perProject = 3, port = 43139, seconds = 0] = process.argv.slice(2, 6).map(Number);
+const archivePath = process.argv[6];
 if (!Number.isInteger(perProject) || perProject < 1 || perProject > 16) throw new Error('Runs/project must be 1–16');
 if (!Number.isInteger(port) || port < 1024 || port > 65535) throw new Error('Port must be 1024–65535');
 if (!Number.isInteger(seconds) || seconds < 0 || seconds > 3600) throw new Error('Duration must be 0–3600 seconds');
@@ -17,6 +19,7 @@ const app = await buildApp({ dataDir: directory, port, ownerToken: 'synthetic-ow
 const repos = [];
 const observations = { query: [], accept: [], queue: [], code: [], integrate: [], endToEnd: [] };
 const users = [];
+const archives = [];
 let stopped = false;
 let readers = [];
 const errors = [];
@@ -57,7 +60,8 @@ try {
     const author = { authorization: 'Bearer ' + developer.token };
     const approver = { authorization: 'Bearer ' + reviewer.token };
     const { specHash } = (await call('/team/projects', 200, author)).data;
-    users.push({ author, approver, list: '/team/projects/' + projectId + '/runs', specHash });
+    users.push({ author, approver, projectId, developerId: developer.id, reviewerId: reviewer.id,
+      list: '/team/projects/' + projectId + '/runs', specHash });
   }
   const start = performance.now();
   for (let round = 0; round < perProject; round++) {
@@ -96,7 +100,15 @@ try {
       const accept = { version: detail.version, commit, reason: 'Synthetic benchmark', requestId: randomUUID() };
       await call(run.path + '/accept', 200, run.approver, accept, 'accept');
       const archive = (await call(run.path + '/archive', 200, run.approver)).data;
-      if (archive.decision?.commit !== commit || archive.attempts.length !== 3) throw new Error('Archive evidence lost');
+      if (archive.status !== 'archived' || archive.id !== detail.id || archive.projectId !== run.projectId ||
+          archive.implementer?.id !== run.developerId || archive.decision?.reviewer?.id !== run.reviewerId ||
+          archive.decision.commit !== commit || archive.decision.version !== accept.version ||
+          archive.frozenBaseline?.specSha256 !== run.specHash ||
+          !isDeepStrictEqual(archive.frozenBaseline, detail.frozenBaseline) ||
+          !isDeepStrictEqual(archive.spec, detail.spec) ||
+          !isDeepStrictEqual(archive.integration, detail.integration) ||
+          !isDeepStrictEqual(archive.attempts, detail.attempts)) throw new Error('Archive evidence lost or changed');
+      if (archivePath) archives.push(archive);
       observations.endToEnd.push(Date.parse(archive.decision.at) - created);
       if (performance.now() < stopSubmitting) run.path = await submit(run);
       else pending.delete(run);
@@ -119,6 +131,13 @@ try {
 } finally {
   stopped = true;
   await Promise.all(readers);
-  await app.close();
-  await rm(directory, { recursive: true, force: true, maxRetries: 3 });
+  try {
+    // Keep each already-verified archive even if a later sample fails.
+    if (archivePath && archives.length) {
+      await writeFile(archivePath, JSON.stringify(archives, null, 2) + '\n', { flag: 'wx', mode: 0o600 });
+    }
+  } finally {
+    await app.close();
+    await rm(directory, { recursive: true, force: true, maxRetries: 3 });
+  }
 }

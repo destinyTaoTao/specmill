@@ -109,6 +109,8 @@ describe('team execution on a frozen synthetic order query', () => {
     expect(integration.checks).toEqual(PILOT_SPEC.criteria.map(({ name, expected }) => ({ name, expected, actual: expected, passed: true })));
     const repo = await repoFor(restored, 'merge');
     expect(await runSampleGit(repo, ['ls-tree', '--name-only', integration.commit])).toBe('dates.sql\norders.sql\npaid.sql\nspec.json\n');
+    expect(await runSampleGit(repo, ['status', '--porcelain'])).toBe('');
+    expect(await runSampleGit(repo, ['for-each-ref', '--format=%(refname)'])).toBe('refs/heads/sample\n');
     // Move HEAD and leave invalid working bytes. Historical evidence must still use the original SHA.
     await runSampleGit(repo, ['update-ref', 'HEAD', dates.commit, integration.commit]);
     await writeFile(join(repo, 'orders.sql'), 'invalid working copy');

@@ -74,34 +74,51 @@ const cases: Order[][] = [
 
 export function checkPilotSql(sql: string): PilotResult['checks'] {
   if (!extractPilotSql(sql)) throw new Error('SQL 超出固定样例的查询范围。');
-  return cases.map((rows, index) => {
-    const db = new Database(':memory:');
-    try {
-      db.exec('PRAGMA temp_store=MEMORY; CREATE TABLE orders(id INTEGER, order_date TEXT, status TEXT)');
-      const insert = db.prepare('INSERT INTO orders VALUES (?,?,?)');
+  const db = new Database(':memory:');
+  try {
+    db.exec('PRAGMA temp_store=MEMORY; CREATE TABLE orders(id INTEGER, order_date TEXT, status TEXT)');
+    const clear = db.prepare('DELETE FROM orders');
+    const insert = db.prepare('INSERT INTO orders VALUES (?,?,?)');
+    const statement = db.prepare(sql).pluck();
+    const params = sql.includes(':') ? [{ start_date: '2026-01-10', end_date: '2026-01-12' }] : [];
+    return cases.map((rows, index) => {
+      // The trusted fixture loader replaces every row before the next read-only query.
+      db.pragma('query_only=OFF');
+      clear.run();
       for (const row of rows) insert.run(...row);
       db.pragma('query_only=ON');
-      const statement = db.prepare(sql);
-      const params = { start_date: '2026-01-10', end_date: '2026-01-12' };
-      const actual = statement.pluck().all(...(sql.includes(':') ? [params] : [])) as number[];
+      const actual = statement.all(...params) as number[];
       const { name, expected } = PILOT_SPEC.criteria[index];
       return { name, expected: [...expected], actual, passed: actual.length === expected.length && actual.every((id, i) => id === expected[i]) };
-    } finally { db.close(); }
-  });
+    });
+  } finally { db.close(); }
 }
 
 const runFile = promisify(execFile);
 const gitNull = process.platform === 'win32' ? 'NUL' : '/dev/null';
-export async function runSampleGit(repo: string, args: string[], commitDate?: string) {
+function invokeSampleGit(repo: string, args: string[]) {
   const env = {
     PATH: process.env.PATH, SystemRoot: process.env.SystemRoot, GIT_CONFIG_NOSYSTEM: '1',
     GIT_CONFIG_GLOBAL: gitNull, GIT_ATTR_NOSYSTEM: '1', GIT_TERMINAL_PROMPT: '0', HOME: repo, XDG_CONFIG_HOME: repo,
-    ...(commitDate ? { GIT_AUTHOR_DATE: commitDate, GIT_COMMITTER_DATE: commitDate } : {}),
   };
-  return (await runFile('git', [
+  return runFile('git', [
     '-c', 'core.hooksPath=' + gitNull, '-c', 'commit.gpgSign=false', '-c', 'core.autocrlf=false',
     '-c', 'user.name=SpecMill Pilot', '-c', 'user.email=pilot@example.invalid', ...args,
-  ], { cwd: repo, env, windowsHide: true, timeout: 8000, maxBuffer: 16384 })).stdout;
+  ], { cwd: repo, env, windowsHide: true, timeout: 8000, maxBuffer: 16384, encoding: 'buffer' });
+}
+
+export async function runSampleGit(repo: string, args: string[]) {
+  return (await invokeSampleGit(repo, args)).stdout.toString('utf8');
+}
+
+export async function runSampleGitWithInput(repo: string, args: string[], input: string) {
+  if (Buffer.byteLength(input) > 16384) throw new Error('Git 命令输入超出固定样例范围。');
+  const command = invokeSampleGit(repo, args);
+  let stdinError: Error | undefined;
+  command.child.stdin!.on('error', error => { stdinError = error; }).end(input);
+  const { stdout } = await command;
+  if (stdinError) throw stdinError;
+  return stdout;
 }
 
 function git(repo: string, ...args: string[]) {
