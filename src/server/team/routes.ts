@@ -5,8 +5,9 @@ import { PILOT_SPEC } from '../pilot/sample.js';
 import { isExecutor, isExecutorEntry, isModel, type ExecutorId } from '../workflow/executor.js';
 import { WorkflowSupervisor } from '../workflow/supervisor.js';
 import { TEAM_SPEC_HASH, TeamError, TeamLedger } from './ledger.js';
+import { validateRepositoryConfig, verifyRepository, verifyRetainedRepository } from './repository.js';
 import { verifyIntegration } from './verify.js';
-import type { TeamClaim, TeamResult } from './contracts.js';
+import type { RepositoryConfig, TeamClaim, TeamDetail, TeamResult } from './contracts.js';
 
 type Role = 'developer' | 'reviewer' | 'both';
 type Project = { projectId: string };
@@ -17,27 +18,47 @@ const object = (properties: Record<string, unknown>) => ({
   type: 'object', properties, required: Object.keys(properties), additionalProperties: false,
 });
 const named = { schema: { body: object({ name: string(80) }) } };
-export type TeamOptions = { agentBin: string; workerModule?: URL; executor?: ExecutorId; model?: string; workers?: number };
+const reviewCommand = {
+  schema: { body: object({ version: { type: 'integer', minimum: 1 }, commit: { type: 'string', pattern: '^[0-9a-f]{40}$' },
+    reason: string(1000), requestId: string(128) }) },
+};
+export type TeamOptions = { agentBin: string; workerModule?: URL; executor?: ExecutorId; model?: string; workers?: number;
+  repository?: RepositoryConfig };
 
 export async function registerTeam(app: FastifyInstance, dataDir: string, options: TeamOptions) {
   const executor = options.executor ?? 'codex';
+  const { model } = options;
   const workers = options.workers ?? 2;
   if (!isExecutor(executor) || !await isExecutorEntry(executor, options.agentBin)) {
     throw new Error('--team-agent 需要 Codex 可执行文件或 Pi JavaScript 入口的绝对路径。');
   }
-  if (executor === 'pi' ? !isModel(options.model) : options.model !== undefined) {
+  if (executor === 'pi' ? !isModel(model) : model !== undefined) {
     throw new Error('--team-model 仅用于 Pi，格式为 provider/model。');
   }
   if (!Number.isInteger(workers) || workers < 1 || workers > 8) throw new Error('--team-workers 必须是 1 至 8 的整数。');
+  const repository = options.repository ? await validateRepositoryConfig(options.repository) : undefined;
   const root = join(dataDir, 'team');
   const workspaceRoot = join(root, 'workspaces');
   await mkdir(workspaceRoot, { recursive: true, mode: 0o700 });
   app.register(async scope => {
-    const ledger = new TeamLedger(join(root, 'team.sqlite'));
+    const ledger = new TeamLedger(join(root, 'team.sqlite'), repository);
+    if (repository && !ledger.admin().projects.some(project => project.id === repository.projectId)) {
+      ledger.close();
+      throw new Error('团队仓库配置必须绑定已创建的项目 ID。');
+    }
     const supervisor = new WorkflowSupervisor<TeamClaim, TeamResult>(ledger, workers, workspaceRoot, options.agentBin,
       options.workerModule ?? new URL('./worker.js', import.meta.url),
       () => scope.log.error('团队工作流调度暂时失败，将重试。'),
       async (claim, result) => {
+        if (claim.task === 'repository' && result?.kind === 'repository') {
+          const agent = result.evidence?.agent;
+          if (!options.workerModule && (agent?.executor !== executor || (model && agent.model !== model))) {
+            return { kind: 'failure', error: 'Worker 的执行器证据与服务配置不符。' };
+          }
+          if (!(await verifyRepository(claim, result.evidence, workspaceRoot))) {
+            return { kind: 'failure', error: '服务端无法独立重建仓库提交并复核证据。' };
+          }
+        }
         if (!options.workerModule && claim.task !== 'integrate' && result?.kind === 'task' &&
             result.artifact?.agent?.executor !== executor) {
           return { kind: 'failure', error: 'Worker 的执行器证据与服务配置不符。' };
@@ -47,7 +68,7 @@ export async function registerTeam(app: FastifyInstance, dataDir: string, option
           return { kind: 'failure', error: '服务端无法独立重建集成提交并复核证据。' };
         }
         return result;
-      }, { executor, model: options.model });
+      }, { executor, model });
     scope.addHook('onReady', async () => supervisor.start());
     scope.addHook('onClose', async () => { try { await supervisor.stop(); } finally { ledger.close(); } });
     scope.addHook('onRequest', async (_request, reply) => { reply.header('Cache-Control', 'no-store'); });
@@ -90,12 +111,35 @@ export async function registerTeam(app: FastifyInstance, dataDir: string, option
     });
     scope.get<{ Params: Run }>('/projects/:projectId/runs/:runId', async request =>
       ledger.get(principal(request), request.params.projectId, request.params.runId));
-    scope.post<{ Params: Run; Body: Accept }>('/projects/:projectId/runs/:runId/accept', {
-      schema: { body: object({ version: { type: 'integer', minimum: 1 }, commit: { type: 'string', pattern: '^[0-9a-f]{40}$' },
-        reason: string(1000), requestId: string(128) }) },
-    }, async request => {
+    async function verifyReviewArtifacts(run: TeamDetail, authorization: RepositoryConfig) {
+      if (!('kind' in run.spec)) return;
+      const spec = run.spec;
+      const artifacts = await Promise.all(run.attempts.map(attempt => {
+        if (attempt.result?.kind !== 'repository') return true;
+        const claim: TeamClaim = { projectId: run.projectId, runId: run.id, task: 'repository', generation: attempt.generation,
+          attemptId: attempt.id, repository: {source: authorization.source, spec} };
+        return verifyRetainedRepository(claim, attempt.result.evidence, workspaceRoot);
+      }));
+      if (!artifacts.every(Boolean)) throw new TeamError(409, 'Git 审计工件缺失或校验失败，请恢复工件后重新核对。');
+    }
+    scope.post<{ Params: Run; Body: Accept }>('/projects/:projectId/runs/:runId/accept', reviewCommand, async request => {
       const { reason, version, commit, requestId } = request.body;
-      return ledger.accept(principal(request), request.params.projectId, request.params.runId, version, commit, reason, requestId);
+      const { projectId, runId } = request.params;
+      const reviewer = principal(request);
+      if (repository?.projectId === projectId) {
+        const run = ledger.get(reviewer, projectId, runId);
+        if (run.canAccept && run.version === version && run.repositoryEvidence?.commit === commit) {
+          await verifyReviewArtifacts(run, repository);
+        }
+      }
+      // The ledger rechecks the exact snapshot, live role and idempotency receipt after asynchronous Git reads.
+      return ledger.accept(reviewer, projectId, runId, version, commit, reason, requestId);
+    });
+    scope.post<{ Params: Run; Body: Accept }>('/projects/:projectId/runs/:runId/return', reviewCommand, async request => {
+      const { reason, version, commit, requestId } = request.body;
+      const result = ledger.returnForRework(principal(request), request.params.projectId, request.params.runId, version, commit, reason, requestId);
+      supervisor.wake();
+      return result;
     });
     scope.get<{ Params: Run }>('/projects/:projectId/runs/:runId/archive', async (request, reply) => {
       const archive = ledger.archive(principal(request), request.params.projectId, request.params.runId);

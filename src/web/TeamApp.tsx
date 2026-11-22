@@ -1,21 +1,42 @@
 import { useEffect, useRef, useState } from 'react';
-import type { TeamDetail, TeamMember, TeamProject, TeamSummary } from '../server/team/contracts.js';
+import type { RepositoryEvidence, TeamDetail, TeamMember, TeamProject, TeamSummary } from '../server/team/contracts.js';
 import { ApiError } from './api';
 import { roles, TeamAdminPanel, teamRequest, teamUrl } from './TeamAdminPanel';
 
 const states = { queued: '等待领取', running: '执行中', review: '待独立复核', archived: '已验收归档', blocked: '执行受阻' };
-const tasks = { dates: '日期范围', paid: '付款状态', integrate: '集成验证' };
-type Directory = { member: TeamMember; spec: TeamDetail['spec']; specHash: string; projects: TeamProject[] };
+const tasks = { dates: '日期范围', paid: '付款状态', integrate: '集成验证', repository: '仓库变更' };
+type Directory = { member: TeamMember; spec: Extract<TeamDetail['spec'], { templateRevision: string }>; specHash: string; projects: TeamProject[] };
 type Session = Directory & { token: string };
 type Command = { path: string; body: { requestId: string; specHash?: string; version?: number; commit?: string; reason?: string } };
+type ReviewAction = 'accept' | 'return';
 
 function Criteria({ spec }: { spec: TeamDetail['spec'] }) {
+  if ('kind' in spec) return <>
+    <h4>{spec.title}</h4><p>{spec.requirement}</p>
+    <p>仓库基线提交 <code>{spec.baseCommit}</code></p><p>允许修改的文件 <code>{spec.path}</code></p>
+    <ul>{spec.checks.map(check => <li key={check.name}>
+      {check.name} · 预期{check.present ? '包含' : '不包含'}文本 <code>{JSON.stringify(check.text)}</code>
+    </li>)}</ul>
+  </>;
   return <><h4>{spec.title}</h4><p>模板修订 {spec.templateRevision}</p><p>{spec.research.scope}</p><p>{spec.research.finding}</p><p>{spec.queryContract}</p><ul>{spec.criteria.map(check => <li key={check.name}>
     {check.description} 预期订单 ID <code>{JSON.stringify(check.expected)}</code>
   </li>)}</ul></>;
 }
 
+function RepositoryResult({ evidence }: { evidence: RepositoryEvidence }) {
+  return <>
+    <p>变更提交 <code>{evidence.commit}</code></p><p>父提交 <code>{evidence.parent}</code></p>
+    <p>文件 <code>{evidence.path}</code> · 内容 SHA-256 <code>{evidence.contentSha256}</code></p>
+    {evidence.agent && <p>Agent {evidence.agent.executor}{evidence.agent.model && ` · ${evidence.agent.model}`}</p>}
+    <ul>{evidence.checks.map(check => <li key={check.name}>{check.name} · {check.passed ? '通过' : '失败'}</li>)}</ul>
+    <pre>{evidence.content}</pre>
+  </>;
+}
+
 function Evidence({ run }: { run: TeamDetail }) {
+  const currentRepository = run.repositoryEvidence;
+  const preceding = currentRepository && run.attempts.filter(a => a.result?.kind === 'repository' &&
+    a.result.evidence.commit !== currentRepository.commit).at(-1)?.result;
   return <>
     <p>实现责任人 {run.implementer.name} · {run.implementer.id}</p>
     <details><summary>已冻结规格 · 版本 {run.frozenBaseline.version}</summary>
@@ -27,12 +48,25 @@ function Evidence({ run }: { run: TeamDetail }) {
       {a.reason && <p>{a.reason}</p>}
       {a.result?.kind === 'failure' && <p>{a.result.error}</p>}
       {a.result?.kind === 'task' && <><p>任务提交 {a.result.artifact.commit}</p><pre>{a.result.artifact.content}</pre></>}
+      {a.repositoryArtifact && <p>服务端 Git 工件 <code>team/workspaces/{a.repositoryArtifact}</code></p>}
+      {a.result?.kind === 'repository' && (a.result.evidence.commit === run.repositoryEvidence?.commit
+        ? <p>变更提交 <code>{a.result.evidence.commit}</code> · 见下方仓库证据</p>
+        : <RepositoryResult evidence={a.result.evidence} />)}
     </details>)}
     {run.integration && <section aria-label="集成证据"><h4>集成证据</h4>
       <p>集成提交 <code>{run.integration.commit}</code></p><p>父提交</p><ul>{run.integration.parents.map(p => <li key={p}><code>{p}</code></li>)}</ul>
       <pre>{run.integration.sql}</pre><ul>{run.integration.checks.map(check => <li key={check.name}>
         {check.name} · {check.passed ? '通过' : '失败'} · 预期 {JSON.stringify(check.expected)}，实际 {JSON.stringify(check.actual)}
       </li>)}</ul></section>}
+    {currentRepository && <section aria-label="仓库证据"><h4>仓库证据</h4>
+      {preceding?.kind === 'repository' && preceding.evidence.contentSha256 === currentRepository.contentSha256 &&
+        <p>当前提交与上次尝试的目标文件内容相同。</p>}
+      <RepositoryResult evidence={currentRepository} />
+    </section>}
+    {!!run.returns?.length && <details><summary>退回记录（{run.returns.length}）</summary><ol>{run.returns.map(record => <li key={record.version}>
+      退回人 {record.reviewer.name} · {record.reviewer.id} · {record.at}<br />
+      退回版本 {record.version} · <code>{record.commit}</code><br />{record.reason}
+    </li>)}</ol></details>}
     <details><summary>审计记录（{run.events.length}）</summary><ol>{run.events.map((event, i) => <li key={i}>
       {event.at} · {event.action} · {event.actor} · {event.reason}
       {event.requestId && <p>请求 {event.requestId}</p>}{event.attemptId && <p>尝试 {event.attemptId}</p>}
@@ -42,14 +76,25 @@ function Evidence({ run }: { run: TeamDetail }) {
   </>;
 }
 
-function SignOff({ run, send, locked }: { run: TeamDetail; send: (reason: string) => void; locked: boolean }) {
+function ReviewActions({ run, canAccept, canReturn, send, locked }: {
+  run: TeamDetail; canAccept: boolean; canReturn: boolean; send: (action: ReviewAction, reason: string) => void; locked: boolean;
+}) {
   const [reason, setReason] = useState('');
   const [confirmed, setConfirmed] = useState(false);
-  return <form onSubmit={e => { e.preventDefault(); if (confirmed && reason.trim() && !locked) send(reason.trim()); }}>
-    <label>验收理由<textarea required maxLength={1000} value={reason} disabled={locked} onChange={e => { setReason(e.target.value); setConfirmed(false); }} /></label>
+  const repository = 'kind' in run.spec;
+  const disabled = locked || !confirmed || !reason.trim();
+  return <form onSubmit={e => {
+    e.preventDefault();
+    const action = ((e.nativeEvent as SubmitEvent).submitter as HTMLButtonElement | null)?.value;
+    if (disabled) return;
+    if (action === 'accept' && canAccept) send(action, reason.trim());
+    if (action === 'return' && canReturn) send(action, reason.trim());
+  }}>
+    <label>{repository ? '复核理由' : '验收理由'}<textarea required maxLength={1000} value={reason} disabled={locked} onChange={e => { setReason(e.target.value); setConfirmed(false); }} /></label>
     <label><input type="checkbox" disabled={locked} checked={confirmed} onChange={e => setConfirmed(e.target.checked)} />
-      我已核对版本 {run.version} 的集成提交与逐项证据</label>
-    <button disabled={locked || !confirmed || !reason.trim()}>签署并归档</button>
+      我已核对版本 {run.version} 的{repository ? '变更' : '集成'}提交与逐项证据</label>
+    {canReturn && <div><button type="submit" value="return" disabled={disabled}>退回重新执行</button></div>}
+    {canAccept && <button type="submit" value="accept" disabled={disabled}>签署并归档</button>}
   </form>;
 }
 
@@ -93,7 +138,7 @@ function ProjectRuns({ session, project, refreshDirectory, onDenied }: { session
     try {
       const receipt = await teamRequest<{ id: string }>(command.path, command.body, session.token);
       if (!mounted.current) return;
-      setPending(null); confirmHash(null); select(receipt.id); refresh(r => r + 1);
+      setPending(null); confirmHash(null); setRun(null); select(receipt.id); refresh(r => r + 1);
     } catch (err) {
       if (!mounted.current || denied(err)) return;
       if (err instanceof ApiError && (err.status ?? 500) < 500 && err.status !== 408) {
@@ -118,14 +163,19 @@ function ProjectRuns({ session, project, refreshDirectory, onDenied }: { session
     finally { if (mounted.current) setBusy(false); }
   }
   const locked = busy || pending !== null;
+  const { spec, specHash } = project.repository ?? session;
   const detail = run?.id === selected ? run : null;
+  const reviewCommit = detail?.repositoryEvidence?.commit ?? detail?.integration?.commit;
+  const canAccept = detail?.status === 'review' && detail.canAccept;
+  const canReturn = Boolean(detail?.repositoryEvidence && detail.canReturn);
   return <section><h3>{project.name} · {roles[project.role]}</h3>
     {error && <p role="alert">{error}</p>}{readError && <p role="alert">{readError}</p>}
     {pending && <button disabled={busy} onClick={() => void send(pending)}>重试原请求</button>}
-    {project.role !== 'reviewer' && <details><summary>新建订单筛选运行</summary>
-      <Criteria spec={session.spec} /><p>规格 SHA-256 <code>{session.specHash}</code></p><p>冻结后，{session.member.name} 将承担日期和付款状态两项实现责任。</p>
-      <label><input type="checkbox" disabled={locked} checked={confirmedHash === session.specHash} onChange={e => confirmHash(e.target.checked ? session.specHash : null)} />我已核对冻结规格及预期结果</label>
-      <button disabled={locked || !confirmedHash || confirmedHash !== session.specHash} onClick={() => void send({ path: base, body: { requestId: crypto.randomUUID(), specHash: session.specHash } })}>冻结并派工</button>
+    {project.role !== 'reviewer' && <details><summary>{project.repository ? '新建仓库变更运行' : '新建订单筛选运行'}</summary>
+      <Criteria spec={spec} /><p>规格 SHA-256 <code>{specHash}</code></p>
+      <p>冻结后，{session.member.name} 将承担{project.repository ? '本次仓库变更' : '日期和付款状态两项'}实现责任。</p>
+      <label><input type="checkbox" disabled={locked} checked={confirmedHash === specHash} onChange={e => confirmHash(e.target.checked ? specHash : null)} />我已核对冻结规格及预期结果</label>
+      <button disabled={locked || confirmedHash !== specHash} onClick={() => void send({ path: base, body: { requestId: crypto.randomUUID(), specHash } })}>冻结并派工</button>
     </details>}
     <h4>项目运行</h4>
     <button disabled={busy} onClick={() => refresh(r => r + 1)}>刷新运行</button>
@@ -133,13 +183,19 @@ function ProjectRuns({ session, project, refreshDirectory, onDenied }: { session
     <ul>{runs?.map(r => <li key={r.id}><button disabled={locked} onClick={() => select(r.id)}>{r.id} · {states[r.status]}</button></li>)}</ul>
     {detail && <section aria-label="运行详情"><h3>运行详情</h3><p role="status">{states[detail.status]} · 版本 {detail.version}</p>
       <Evidence run={detail} />
-      {detail.status === 'review' && (detail.implementer.id === session.member.id ? <p>你是本次实现责任人，请由另一名获授权成员验收。</p>
+      {(detail.status === 'review' || canReturn) && (detail.implementer.id === session.member.id ? <p>你是本次实现责任人，请由另一名获授权成员验收。</p>
         : project.role === 'developer' ? <p>本项目需要具有复核权限的成员验收。</p>
-        : detail.canAccept && detail.integration ? <SignOff key={detail.id + detail.version} run={detail} locked={locked}
-          send={reason => void send({ path: base + '/' + detail.id + '/accept', body: {
-            requestId: crypto.randomUUID(), version: detail.version, commit: detail.integration!.commit, reason,
-          } })} /> : <p>当前证据尚未满足验收条件。</p>)}
-      {detail.status === 'archived' && <button disabled={locked} onClick={() => void download(detail.id)}>下载验收归档</button>}
+        : <>
+          {!canAccept && <p>当前证据尚未满足验收条件。</p>}
+          {(canAccept || canReturn) && reviewCommit && <ReviewActions key={`${detail.id}:${detail.version}:${reviewCommit}`} run={detail}
+            canAccept={canAccept} canReturn={canReturn} locked={locked}
+            send={(action, reason) => void send({ path: base + '/' + detail.id + '/' + action, body: {
+              requestId: crypto.randomUUID(), version: detail.version, commit: reviewCommit, reason,
+            } })} />}
+        </>)}
+      {detail.status === 'archived' && <button disabled={locked} onClick={() => void download(detail.id)}>
+        {'kind' in detail.spec ? '下载验收归档 JSON' : '下载验收归档'}
+      </button>}
     </section>}
   </section>;
 }
