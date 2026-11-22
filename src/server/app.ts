@@ -17,6 +17,7 @@ import { registerRecovery } from './features/recovery.js';
 import { registerProjectOverviews } from './features/project-overviews.js';
 import { registerPilot, type PilotOptions } from './pilot/routes.js';
 import { registerTeam, type TeamOptions } from './team/routes.js';
+import { assertRepositoryDataPath } from './team/repository.js';
 import { checkProjectCapacity, DEFAULT_RECORDS_LIMIT, ProjectCapacityExceeded } from './storage/project-capacity.js';
 import { requestIdUsedElsewhere } from './storage/request-ids.js';
 
@@ -33,8 +34,21 @@ function sendError(request: FastifyRequest, reply: FastifyReply, status: number,
 export async function buildApp(options: AppOptions) {
   const recordsLimit = options.maxProjectRecordsBytes ?? DEFAULT_RECORDS_LIMIT;
   if (!Number.isSafeInteger(recordsLimit) || recordsLimit <= 0) throw new Error('Invalid project capacity limit');
+  if (options.team?.repository) {
+    const { source } = options.team.repository;
+    const dataDir = resolve(options.dataDir);
+    // Existing local data paths may be aliases. Resolve them before creating a lock or SQLite sidecar.
+    const targets = [dataDir, ...[
+      'specmill.db', 'specmill.db-wal', 'specmill.db-shm', 'specmill.db-journal', 'backups', 'attachments', 'team',
+      'team/workspaces', 'team/team.sqlite', 'team/team.sqlite-wal', 'team/team.sqlite-shm', 'team/team.sqlite-journal',
+      ...(options.pilot ? ['pilot', 'pilot/workflow.sqlite', 'pilot/workflow.sqlite-wal', 'pilot/workflow.sqlite-shm',
+        'pilot/workflow.sqlite-journal'] : []),
+    ].map(path => join(dataDir, path))];
+    await Promise.all(targets.map(target => assertRepositoryDataPath(source, target)));
+  }
   await mkdir(options.dataDir, { recursive: true });
   const dir = await realpath(options.dataDir);
+  if (options.team?.repository) await assertRepositoryDataPath(options.team.repository.source, dir + '.lock');
   let unlock: () => Promise<void>;
   try {
     unlock = await lockfile.lock(dir, { realpath: false, stale: 10000, retries: 0 });

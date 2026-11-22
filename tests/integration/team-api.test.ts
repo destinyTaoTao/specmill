@@ -1,11 +1,12 @@
 import { randomUUID } from 'node:crypto';
-import { cp, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { cp, mkdir, mkdtemp, rename, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { FastifyInstance } from 'fastify';
 import { describe, expect, it } from 'vitest';
 import { buildApp } from '../../src/server/app.js';
-import type { TeamDetail } from '../../src/server/team/contracts.js';
+import { runSampleGit } from '../../src/server/pilot/sample.js';
+import type { RepositoryConfig, TeamDetail, TeamProject } from '../../src/server/team/contracts.js';
 
 const host = '127.0.0.1:43327';
 const origin = 'http://' + host;
@@ -109,4 +110,121 @@ describe('team projects and independent acceptance through HTTP', () => {
       await rm(restored, { recursive: true, force: true });
     }
   }, 30000);
+
+  it('binds repository return, redispatch and archive to a named reviewer and exact Git targets', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'specmill-team-repository-api-'));
+    const dataDir = join(directory, 'data');
+    const source = join(directory, 'approved');
+    const agentBin = join(directory, 'approved-pi.mjs');
+    const path = 'release.txt';
+    const model = 'test/repository';
+    const reviewReason = 'Append REVIEWED after READY.';
+    const open = (repository?: RepositoryConfig, storage = dataDir) => buildApp({
+      dataDir: storage, port: 43327, ownerToken: 'owner-for-team-test', agentToken: 'legacy-tool-for-team-test',
+      team: { agentBin, executor: 'pi', model, repository, workerModule: new URL('../fixtures/repository-worker.mjs', import.meta.url) },
+    });
+    let app: FastifyInstance | undefined;
+    try {
+      await mkdir(source);
+      await runSampleGit(source, ['init', '--quiet', '--template=', '--initial-branch=main', '--object-format=sha1']);
+      await writeFile(join(source, path), 'DRAFT\n');
+      await runSampleGit(source, ['add', '--', path]);
+      await runSampleGit(source, ['commit', '-qm', 'Frozen base']);
+      const baseCommit = (await runSampleGit(source, ['rev-parse', 'HEAD'])).trim();
+      await writeFile(agentBin, `
+        import assert from 'node:assert/strict';
+        import { readFileSync } from 'node:fs';
+        const prompt = readFileSync(0, 'utf8');
+        const input = JSON.parse(prompt.slice(prompt.indexOf('\\n') + 1));
+        assert.equal(input.original, 'DRAFT\\n');
+        if (input.previous) assert.deepEqual(input.previous, {content:'READY\\n', reason:${JSON.stringify(reviewReason)}});
+        const text = input.previous ? 'READY\\nREVIEWED\\n' : 'READY\\n';
+        console.log(JSON.stringify({type:'agent_end', messages:[{role:'assistant', stopReason:'stop',
+          provider:'test', model:'repository', content:[{type:'text', text}]}]}));
+      `);
+      app = await open();
+      const login = (service: FastifyInstance) => service.inject({ method: 'POST', url: '/api/v1/session',
+        headers: { host, origin }, payload: { token: 'owner-for-team-test' } });
+      const admin = async (service: FastifyInstance) =>
+        http(service, { cookie: String((await login(service)).headers['set-cookie']).split(';')[0] });
+      let owner = await admin(app);
+      const { id: projectId } = (await owner('/admin/projects', { name: 'Release repository' })).json();
+      const { id: other } = (await owner('/admin/projects', { name: 'Other' })).json();
+      const author = (await owner('/admin/members', { name: 'Fixture author' })).json();
+      const reviewer = (await owner('/admin/members', { name: 'Fixture reviewer' })).json();
+      const outsider = (await owner('/admin/members', { name: 'Fixture outsider' })).json();
+      const grant = (memberId: string, role: string | null, project = projectId) =>
+        owner('/admin/grants', {projectId: project, memberId, role});
+      expect((await grant(author.id, 'both')).statusCode).toBe(200);
+      expect((await grant(reviewer.id, 'reviewer')).statusCode).toBe(200);
+      expect((await grant(outsider.id, 'both', other)).statusCode).toBe(200);
+      await app.close();
+      app = undefined;
+      const config: RepositoryConfig = { projectId, source, spec: {kind:'repository-v1', title:'Release',
+        requirement:'Set READY.', path, baseCommit, checks:[{name:'Ready', text:'READY', present:true}] } };
+      await expect(open(config, join(source, 'prohibited'))).rejects.toThrow('仓库');
+      const aliasedStorage = join(directory, 'aliased-data');
+      await mkdir(aliasedStorage);
+      await symlink(source, join(aliasedStorage, 'team'), 'junction');
+      await expect(open(config, aliasedStorage)).rejects.toThrow('仓库');
+      expect(await runSampleGit(source, ['status', '--porcelain'])).toBe('');
+      app = await open(config);
+      owner = await admin(app);
+      const principal = (service: FastifyInstance, token: string) => http(service, { authorization:'Bearer ' + token });
+      const dev = principal(app, author.token), review = principal(app, reviewer.token), foreign = principal(app, outsider.token);
+      const memberDirectory = (await dev('/projects')).json<{projects: TeamProject[]; specHash: string}>();
+      const specHash = memberDirectory.projects[0].repository!.specHash;
+      expect((await foreign('/projects')).body).not.toContain(specHash);
+      const list = '/projects/' + projectId + '/runs';
+      expect((await dev(list, {requestId:randomUUID(), specHash:memberDirectory.specHash})).statusCode).toBe(409);
+      const started = await dev(list, {requestId:randomUUID(), specHash});
+      expect(started.statusCode).toBe(201);
+      const target = list + '/' + started.json().id;
+      const read = async () => (await review(target)).json<TeamDetail>();
+      await expect.poll(async () => (await read()).status, {timeout:15000}).toBe('review');
+      const first = await read();
+      expect(first.repositoryEvidence).toMatchObject({path, parent:baseCommit, content:'READY\n'});
+      const sendBack = {requestId:randomUUID(), version:first.version, commit:first.repositoryEvidence!.commit, reason:reviewReason};
+      expect((await dev(target + '/return', sendBack)).statusCode).toBe(403);
+      expect([403, 404]).toContain((await foreign(target + '/return', sendBack)).statusCode);
+      await grant(reviewer.id, null);
+      expect([403, 404]).toContain((await review(target + '/return', sendBack)).statusCode);
+      await grant(reviewer.id, 'reviewer');
+      expect((await review(target + '/return', {...sendBack, commit:'0'.repeat(40)})).statusCode).toBe(409);
+      for (let retry = 0; retry < 2; retry++) expect((await review(target + '/return', sendBack)).statusCode).toBe(200);
+      expect((await review(target + '/accept', {...sendBack, requestId:randomUUID()})).statusCode).toBe(409);
+      await expect.poll(async () => (await read()).status, {timeout:15000}).toBe('review');
+      const second = await read();
+      expect(second.frozenBaseline).toEqual(first.frozenBaseline);
+      expect(second.returns).toMatchObject([{reviewer:{id:reviewer.id}, commit:sendBack.commit, version:first.version, reason:reviewReason}]);
+      expect(second.attempts.map(attempt => attempt.generation)).toEqual([1, 2]);
+      expect(second.repositoryEvidence).toMatchObject({path, parent:baseCommit, content:'READY\nREVIEWED\n'});
+      expect(second.repositoryEvidence!.commit).not.toBe(sendBack.commit);
+      const approved = {requestId:randomUUID(), version:second.version, commit:second.repositoryEvidence!.commit, reason:'Second target verified.'};
+      const firstArtifact = join(dataDir, 'team', 'workspaces', second.attempts[0].repositoryArtifact!);
+      const withheld = join(directory, 'withheld-artifact');
+      await rename(firstArtifact, withheld);
+      const missingArtifact = await review(target + '/accept', approved);
+      expect(missingArtifact.statusCode).toBe(409);
+      expect(missingArtifact.json().message).toContain('工件缺失');
+      expect((await review(target + '/archive')).statusCode).toBe(409);
+      await rename(withheld, firstArtifact);
+      expect((await review(target + '/accept', approved)).statusCode).toBe(200);
+      expect((await review(target + '/accept', approved)).statusCode).toBe(200);
+      const archive = await review(target + '/archive');
+      expect(archive.statusCode).toBe(200);
+      expect(archive.json().attempts.map((a: TeamDetail['attempts'][number]) => a.repositoryArtifact)).toEqual(
+        second.attempts.map(a => a.repositoryArtifact));
+      expect(archive.json().decision).toMatchObject({reviewer:{id:reviewer.id}, commit:approved.commit, version:second.version});
+      expect(archive.body).not.toContain(source);
+      expect(archive.body).not.toContain(reviewer.token);
+      await app.close();
+      app = undefined;
+      app = await open();
+      expect((await principal(app, reviewer.token)(target + '/archive')).body).toBe(archive.body);
+    } finally {
+      await app?.close();
+      await rm(directory, {recursive:true, force:true, maxRetries:3});
+    }
+  }, 45000);
 });

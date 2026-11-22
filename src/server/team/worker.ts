@@ -1,5 +1,6 @@
 import { askAgent, type ExecutorId } from '../workflow/executor.js';
 import type { TeamClaim, TeamResult } from './contracts.js';
+import { runRepositoryTask } from './repository.js';
 import { commitTask, createTeamWorkspace, integrateTasks, validScope } from './workspace.js';
 
 type TeamJob = TeamClaim & { root: string; agentBin: string; executor?: ExecutorId; model?: string };
@@ -12,6 +13,7 @@ const prompts = {
 };
 
 async function work(job: TeamJob, signal: AbortSignal): Promise<TeamResult> {
+  if (job.task === 'repository') return runRepositoryTask(job, signal);
   if (!validScope(job) || !['dates', 'paid', 'integrate'].includes(job.task)) {
     return { kind: 'failure', error: 'Worker 收到无效的团队任务。' };
   }

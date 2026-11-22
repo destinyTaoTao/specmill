@@ -5,6 +5,7 @@ import { homedir } from 'node:os';
 import { rename, rm, writeFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { buildApp } from './app.js';
+import { loadRepositoryConfig } from './team/repository.js';
 import { isExecutor } from './workflow/executor.js';
 import { encodeSecret } from '../shared/credentials.js';
 
@@ -24,15 +25,17 @@ const ownerToken = randomBytes(32).toString('hex');
 const agentToken = randomBytes(32).toString('hex');
 const agentBin = option('--pilot-agent', '');
 const teamAgent = option('--team-agent', '');
+const repositoryFile = option('--team-repository', '');
 const executor = option('--team-executor', 'codex');
 const model = option('--team-model', '') || undefined;
 const workers = Number(option('--team-workers', '2'));
 if (!isExecutor(executor)) throw new Error('--team-executor must be codex or pi');
-if (!teamAgent && ['--team-executor', '--team-model', '--team-workers'].some(flag => args.includes(flag))) {
+if (!teamAgent && ['--team-executor', '--team-model', '--team-workers', '--team-repository'].some(flag => args.includes(flag))) {
   throw new Error('Team configuration requires --team-agent');
 }
+const repository = repositoryFile ? await loadRepositoryConfig(resolve(repositoryFile)) : undefined;
 const app = await buildApp({ dataDir, port, ownerToken, agentToken, webDir: join(packageRoot, 'dist'),
-  pilot: agentBin ? { agentBin } : undefined, team: teamAgent ? { agentBin: teamAgent, executor, model, workers } : undefined });
+  pilot: agentBin ? { agentBin } : undefined, team: teamAgent ? { agentBin: teamAgent, executor, model, workers, repository } : undefined });
 try {
   const temporary = join(dataDir, `cli-token-${randomUUID()}.tmp`);
   try {
