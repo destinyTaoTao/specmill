@@ -2,6 +2,7 @@ import type { FastifyInstance, FastifyRequest } from 'fastify';
 import type Database from 'better-sqlite3';
 import { randomUUID } from 'node:crypto';
 import { checkProjectCapacity, projectRecordBytes } from '../storage/project-capacity.js';
+import { confirmedTarget, blockingFailures } from '../storage/acceptance-context.js';
 import { checkAttachmentHealth } from '../storage/attachments.js';
 import { evidenceCriterionMatches } from '../storage/evidence-integrity.js';
 import { createHandoffSnapshotRow } from './handoffs.js';
@@ -38,9 +39,7 @@ export function registerReview(app: FastifyInstance, db: Database.Database, reco
     if (!change.baselineId) return null;
     const baseline = db.prepare('SELECT id, draft_revision_id AS criterionRevisionId, criteria_json AS criteriaJson FROM baselines WHERE id = ? AND change_id = ?').get(change.baselineId, change.id) as { id: string; criterionRevisionId: string; criteriaJson: string } | undefined;
     if (!baseline) return null;
-    const target = db.prepare("SELECT id, commit_sha AS commitSha, workspace_id AS workspaceId, status, confirmed_at AS confirmedAt FROM acceptance_targets WHERE change_id = ? AND status = 'confirmed' AND confirmation_order IS NOT NULL ORDER BY confirmation_order DESC LIMIT 1").get(change.id) as { id: string; commitSha: string; workspaceId: string; status: string; confirmedAt: string } | undefined;
-    const targetOrderUncertain = !target && Boolean(db.prepare("SELECT 1 FROM acceptance_targets WHERE change_id = ? AND status = 'confirmed' LIMIT 1").get(change.id));
-    return { baselineId: baseline.id, criterionRevisionId: baseline.criterionRevisionId, criteria: JSON.parse(baseline.criteriaJson) as Criterion[], target: target ?? null, targetOrderUncertain };
+    return { baselineId: baseline.id, criterionRevisionId: baseline.criterionRevisionId, criteria: JSON.parse(baseline.criteriaJson) as Criterion[], ...confirmedTarget(db, change.id) };
   };
   const snapshotOf = (change: ChangeRow & { id: string }, context: NonNullable<ReturnType<typeof contextOf>>): ReviewSnapshot => ({
     version: change.version, cycle: change.cycle, baselineId: context.baselineId, criterionRevisionId: context.criterionRevisionId, targetId: context.target?.id ?? null,
@@ -50,8 +49,6 @@ export function registerReview(app: FastifyInstance, db: Database.Database, reco
     dispositionCount: (db.prepare('SELECT COUNT(*) AS count FROM failure_dispositions WHERE change_id = ?').get(change.id) as { count: number }).count,
   });
   const sameSnapshot = (left: ReviewSnapshot, right: ReviewSnapshot) => sameFingerprint(JSON.stringify(left), right);
-  // 阻塞失败：当前基线上该条件的结果为失败、且尚无处置覆盖的失败证据。
-  const blockingFailures = (changeId: string, cycle: number, baselineId: string, criterionId: string, targetId: string | null) => db.prepare(`SELECT e.id, e.actual_commit AS actualCommit, e.notes FROM evidence_records e WHERE e.change_id = ? AND e.cycle = ? AND e.baseline_id = ? AND e.criterion_id = ? AND e.result = 'failed' AND NOT EXISTS (SELECT 1 FROM failure_dispositions d WHERE d.failure_evidence_id = e.id AND d.cycle = ? AND d.target_id = ?) AND NOT EXISTS (SELECT 1 FROM decisions w WHERE w.change_id = e.change_id AND w.cycle = ? AND w.baseline_id = e.baseline_id AND w.criterion_id = e.criterion_id AND w.target_id = ? AND w.result = 'waived' AND w.superseded_by IS NULL AND EXISTS (SELECT 1 FROM json_each(w.evidence_ids_json) WHERE json_each.value = e.id))`).all(changeId, cycle, baselineId, criterionId, cycle, targetId, cycle, targetId) as { id: string; actualCommit: string | null; notes: string }[];
   const effectiveDecision = (changeId: string, cycle: number, baselineId: string, criterionId: string, targetId: string | null) => db.prepare('SELECT id, result, evidence_ids_json AS evidenceIdsJson, reason, actor, created_at AS createdAt FROM decisions WHERE change_id = ? AND cycle = ? AND baseline_id = ? AND criterion_id = ? AND (target_id = ? OR ? IS NULL) AND superseded_by IS NULL ORDER BY created_at DESC, id DESC LIMIT 1').get(changeId, cycle, baselineId, criterionId, targetId, targetId) as { id: string; result: string; evidenceIdsJson: string; reason: string; actor: string; createdAt: string } | undefined;
 
   const dispositionHistory = (changeId: string, currentCriteria: Criterion[]) => {
@@ -99,7 +96,7 @@ export function registerReview(app: FastifyInstance, db: Database.Database, reco
     const attachmentChecks = new Map<string, Promise<boolean>>();
     const criteria = await Promise.all(context.criteria.map(async (criterion, index) => {
       const decision = effectiveDecision(change.id, change.cycle, context.baselineId, criterion.id, context.target?.id ?? null);
-      const failures = blockingFailures(change.id, change.cycle, context.baselineId, criterion.id, context.target?.id ?? null);
+      const failures = blockingFailures(db, change.id, change.cycle, context.baselineId, criterion.id, context.target?.id ?? null);
       const dispositions = historyByCriterion.get(criterion.id) ?? [];
       const rows = db.prepare("SELECT id, baseline_id AS baselineId, criterion_index AS criterionIndex, actual_commit AS actualCommit, formal, created_at AS createdAt, attachment_ids_json AS attachmentIdsJson FROM evidence_records WHERE change_id = ? AND cycle = ? AND criterion_id = ? AND result = 'passed' ORDER BY created_at DESC, id DESC").all(change.id, change.cycle, criterion.id) as { id: string; baselineId: string | null; criterionIndex: number; actualCommit: string | null; formal: number; createdAt: string; attachmentIdsJson: string }[];
       const candidates = [];
@@ -192,7 +189,7 @@ export function registerReview(app: FastifyInstance, db: Database.Database, reco
     async function qualifies(change: ChangeRow & { id: string }, context: NonNullable<ReturnType<typeof contextOf>>, selection: Selection): Promise<{ ok: true } | { ok: false; status: number; code: string; message: string }> {
       const criterion = context.criteria.find(item => item.id === selection.criterionId);
       if (!criterion) return { ok: false, status: 404, code: 'CRITERION_NOT_FOUND', message: '条件不属于当前冻结基线。' };
-      const failures = blockingFailures(change.id, change.cycle, context.baselineId, selection.criterionId, context.target?.id ?? null);
+      const failures = blockingFailures(db, change.id, change.cycle, context.baselineId, selection.criterionId, context.target?.id ?? null);
       if (failures.length > 0) return { ok: false, status: 409, code: 'BLOCKED_BY_FAILURE', message: `条件存在尚未处置的失败证据（${failures.length} 项），请先处置或豁免。` };
       if (selection.evidenceIds.length === 0) return { ok: false, status: 400, code: 'EVIDENCE_REQUIRED', message: '确认通过至少需要引用一项证据。' };
       for (const evidenceId of selection.evidenceIds) {
@@ -277,7 +274,7 @@ export function registerReview(app: FastifyInstance, db: Database.Database, reco
       const context = contextOf(change);
       if (!context || !context.target || context.baselineId !== preview.baseline_id || context.criterionRevisionId !== preview.criterion_revision_id || context.target.id !== preview.target_id) return 'PREVIEW_STALE';
       for (const selection of selections) {
-        const failures = blockingFailures(change.id, change.cycle, context.baselineId, selection.criterionId, context.target?.id ?? null);
+        const failures = blockingFailures(db, change.id, change.cycle, context.baselineId, selection.criterionId, context.target?.id ?? null);
         if (failures.length > 0) return 'PREVIEW_STALE';
         for (const evidenceId of selection.evidenceIds) {
           const row = db.prepare('SELECT result, formal, baseline_id, criterion_id, criterion_index, actual_commit, attachment_ids_json, change_id, project_id FROM evidence_records WHERE id = ?').get(evidenceId) as { result: string; formal: number; baseline_id: string | null; criterion_id: string | null; criterion_index: number; actual_commit: string | null; attachment_ids_json: string; change_id: string } | undefined;
@@ -291,7 +288,7 @@ export function registerReview(app: FastifyInstance, db: Database.Database, reco
         for (const criterion of context.criteria) {
           const decision = effectiveDecision(change.id, change.cycle, context.baselineId, criterion.id, context.target.id);
           if (!selected.has(criterion.id) && (!decision || decision.result === 'failed')) return 'GATE_INCOMPLETE';
-          if (blockingFailures(change.id, change.cycle, context.baselineId, criterion.id, context.target?.id ?? null).length > 0) return 'GATE_INCOMPLETE';
+          if (blockingFailures(db, change.id, change.cycle, context.baselineId, criterion.id, context.target?.id ?? null).length > 0) return 'GATE_INCOMPLETE';
         }
       }
       const before = projectRecordBytes(db, change.projectId);
@@ -310,10 +307,10 @@ export function registerReview(app: FastifyInstance, db: Database.Database, reco
       let accepted = false;
       if (payload.complete) {
         db.prepare("UPDATE writer_sessions SET status = 'completed', ended_at = ? WHERE change_id = ? AND status = 'active'").run(committedAt, change.id);
+        db.prepare('UPDATE changes SET phase = ?, version = ? WHERE id = ?').run('Accepted', recordVersion, change.id);
         // 最终固定快照：验收完成时在同一事务捕获全部记录，失败回滚不留快照。
         const snapshot = createHandoffSnapshotRow(db, change.id);
         db.prepare("INSERT INTO change_transitions(id,change_id,from_phase,to_phase,cycle,record_version,reason,created_at) VALUES (?,?,?,?,?,?,?,?)").run(randomUUID(), change.id, change.phase, 'Accepted', change.cycle, recordVersion, snapshot ? `用户完成冻结版本验收；完成快照 ${snapshot.snapshotId}` : '用户完成冻结版本验收', committedAt);
-        db.prepare('UPDATE changes SET phase = ?, version = ? WHERE id = ?').run('Accepted', recordVersion, change.id);
         accepted = true;
       } else {
         db.prepare('UPDATE changes SET version = ? WHERE id = ?').run(recordVersion, change.id);

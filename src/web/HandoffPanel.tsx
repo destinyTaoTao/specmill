@@ -5,7 +5,8 @@ type Change = { id: string; version: number };
 type Workspace = { id: string; path: string; version: number };
 type Snapshot = { id: string; createdAt: string; capturedVersion: number; phase: string; cycle: number };
 type Diff = { headChanged: boolean; trackedDiffChanged: boolean | null; added: { path: string; status: string }[]; removed: { path: string; status: string }[]; changed: { path: string; status: string }[] };
-type Continuation = { savedObservation: { id: string; createdAt: string; head: string | null }; fresh: { head: string | null; stable: boolean }; diff: Diff; hasUnsavedChanges: boolean; notice: string };
+type ComparedWorkspace = { path: string; bindingVersion: number; head: string | null };
+type Continuation = { savedObservation: ComparedWorkspace; fresh: ComparedWorkspace & { stable: boolean }; diff: Diff; notice: string };
 
 export function HandoffPanel({ change, workspaces }: { change: Change; workspaces: Workspace[] }) {
   const [snapshots, setSnapshots] = useState<Snapshot[] | null>(null);
@@ -50,9 +51,11 @@ export function HandoffPanel({ change, workspaces }: { change: Change; workspace
     <button disabled={busy} onClick={() => { void create(); }}>生成固定交接</button>
     {snapshots === null ? <p>正在读取交接快照。</p> : snapshots.length === 0 ? <p>尚无交接快照。</p> : <ul>{snapshots.map(item => <li key={item.id}>快照 {item.id} · 捕获版本 {item.capturedVersion} · {item.createdAt} · <button disabled={busy} onClick={() => { void renderSnapshot(item.id); }}>读取固定交接</button></li>)}</ul>}
     {rendered && <div><p>快照 {rendered.id} 的固定材料：</p><pre aria-label="固定交接材料" style={{ whiteSpace: 'pre-wrap' }}>{rendered.markdown}</pre></div>}
-    <label>续做核对工作区<select value={workspaceId} onChange={event => setWorkspaceId(event.target.value)}><option value="">请选择工作区</option>{workspaces.map(item => <option key={item.id} value={item.id}>{item.path}</option>)}</select></label>
+    <label>续做核对工作区<select value={workspaceId} disabled={busy} onChange={event => { setWorkspaceId(event.target.value); setContinuation(null); setError(''); }}><option value="">请选择工作区</option>{workspaces.map(item => <option key={item.id} value={item.id}>{item.path}</option>)}</select></label>
     <button disabled={busy || !workspaceId} onClick={() => { void compare(); }}>对比最近保存点与当前文件</button>
-    {continuation && <div><p>{continuation.notice}</p><p>保存点观察 HEAD：{continuation.savedObservation.head ?? '尚无提交'} · 当前 HEAD：{continuation.fresh.head ?? '尚无提交'}{continuation.fresh.stable ? '' : ' · 本次观察不稳定'}</p>
+    {continuation && <div><p role="status">{continuation.notice}</p>
+      <p>原观察：{continuation.savedObservation.path} · 绑定版本 {continuation.savedObservation.bindingVersion} · HEAD {continuation.savedObservation.head ?? '尚无提交'}</p>
+      <p>本次核对：{continuation.fresh.path} · 绑定版本 {continuation.fresh.bindingVersion} · HEAD {continuation.fresh.head ?? '尚无提交'}{continuation.fresh.stable ? '' : ' · 本次观察不稳定'}</p>
       {(continuation.diff.added.length > 0 || continuation.diff.removed.length > 0 || continuation.diff.changed.length > 0) && <ul>{[...continuation.diff.added.map(item => `新增 ${item.status} ${item.path}`), ...continuation.diff.removed.map(item => `移除 ${item.status} ${item.path}`), ...continuation.diff.changed.map(item => `变化 ${item.status} ${item.path}`)].map(item => <li key={item}>{item}</li>)}</ul>}
     </div>}
   </section>;

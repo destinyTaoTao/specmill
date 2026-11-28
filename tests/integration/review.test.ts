@@ -86,16 +86,45 @@ describe('review confirmation and acceptance', () => {
       expect(preview.statusCode).toBe(201);
       return app.inject({ method: 'POST', url: `/api/v1/changes/${changeId}/review/failure-dispositions/confirm`, headers: ownerHeaders, payload: { requestId: `target-disposition-commit-${suffix}`, payload: { previewId: preview.json().resourceId } } });
     };
+    const capture = async (requestId: string) => {
+      const created = await app.inject({ method: 'POST', url: `/api/v1/changes/${changeId}/handoffs`, headers: ownerHeaders, payload: { requestId } });
+      expect(created.statusCode).toBe(201);
+      const url = `/api/v1/handoffs/${created.json().resourceId}`;
+      const snapshot = (await app.inject({ url, headers: ownerHeaders })).json();
+      const render = async () => (await app.inject({ url: url + '/render', headers: ownerHeaders })).json();
+      return { snapshot, render };
+    };
+    const before = await capture('handoff-before-disposition');
+    const rendered = await before.render();
+    expect(rendered.markdown).toContain(before.snapshot.criteria[0].text);
+    expect(rendered.markdown).not.toContain('[object Object]');
+    expect(before.snapshot.acceptance).toMatchObject({
+      target: { id: first.json().resourceId, commitSha: headSha },
+      openFailureIds: [failure.json().resourceId],
+      evidence: [expect.objectContaining({ id: failure.json().resourceId, executionId: run.json().resourceId,
+        actualCommit: headSha, criterionId: criteria[0].id, result: 'failed' })],
+    });
+    expect(rendered.markdown).toContain(headSha);
+    expect(rendered.markdown).toContain(failure.json().resourceId);
     const firstDisposition = await dispose(3, 'first');
     expect(firstDisposition.statusCode).toBe(200);
+    const passId = await formalEvidence(app, changeId, workspaceId, ownerHeaders, 'handoff-passing', 2, criteria[1].id, baselineId, headSha);
     const review = async () => (await app.inject({ url: `/api/v1/changes/${changeId}/review`, headers: ownerHeaders })).json();
     expect((await review()).criteria[0].blockingFailures).toHaveLength(0);
+    const after = await capture('handoff-after-disposition');
+    expect(after.snapshot.acceptance.openFailureIds).toEqual([]);
+    expect((await after.render()).markdown).toContain(passId);
+    expect(rendered.markdown).not.toContain(passId);
+    expect(await before.render()).toEqual(rendered);
     const second = await createTarget('target-disposition-second');
     expect(second.statusCode).toBe(201);
     expect((await confirmTarget(second.json().resourceId, 'target-disposition-confirm-second')).statusCode).toBe(200);
     const changed = await review();
     expect(changed.criteria[0].blockingFailures.map((item: { id: string }) => item.id)).toContain(failure.json().resourceId);
     expect(changed.criteria[0].dispositions[0].targetId).toBe(first.json().resourceId);
+    const switched = await capture('handoff-after-target-change');
+    expect(switched.snapshot.acceptance.target.id).toBe(second.json().resourceId);
+    expect(switched.snapshot.acceptance.openFailureIds).toEqual([failure.json().resourceId]);
     const secondDisposition = await dispose(firstDisposition.json().recordVersion, 'second');
     expect(secondDisposition.statusCode).toBe(200);
     const resolved = await review();
@@ -104,8 +133,18 @@ describe('review confirmation and acceptance', () => {
     const exported = await app.inject({ method: 'POST', url: `/api/v1/projects/${projectId}/exports`, headers: ownerHeaders, payload: { requestId: 'disposition-legacy-export' } });
     const archive = await app.inject({ url: `/api/v1/exports/${exported.json().resourceId}/download`, headers: ownerHeaders });
     const entries = parseZip(archive.rawPayload, () => true);
-    const records = JSON.parse(entries.get('records.json')!.toString()) as { failureDispositions: Record<string, unknown>[] };
+    const records = JSON.parse(entries.get('records.json')!.toString()) as {
+      failureDispositions: Record<string, unknown>[]; handoffSnapshots: { id: string; content_json: string }[];
+    };
     for (const row of records.failureDispositions) delete row.target_id;
+    // Older snapshots may contain structured frozen criteria or plain text and no acceptance summary.
+    for (const row of records.handoffSnapshots) {
+      if (row.id === switched.snapshot.snapshotId) continue;
+      const legacy = JSON.parse(row.content_json);
+      delete legacy.acceptance;
+      if (row.id === after.snapshot.snapshotId) legacy.criteria = legacy.criteria.map((criterion: { text: string }) => criterion.text);
+      row.content_json = JSON.stringify(legacy);
+    }
     const bytes = Buffer.from(JSON.stringify(records));
     const manifest = JSON.parse(entries.get('manifest.json')!.toString()) as { schemaVersion: number; files: { path: string; sha256: string; size: number }[] };
     manifest.schemaVersion = 17;
@@ -119,6 +158,14 @@ describe('review confirmation and acceptance', () => {
     const restoredOwner = { ...base, cookie: login.headers['set-cookie'] as string, 'x-specmill-request': '1' };
     const imported = await restoredApp.inject({ method: 'POST', url: '/api/v1/restore?requestId=disposition-legacy-restore', headers: { ...restoredOwner, 'content-type': 'application/octet-stream' }, payload: buildZip([...entries].map(([name, data]) => ({ name, data }))) });
     expect(imported.statusCode).toBe(201);
+    const restoredRender = async (id: string) => (await restoredApp.inject({ url: `/api/v1/handoffs/${id}/render`, headers: restoredOwner })).json();
+    for (const snapshot of [before.snapshot, after.snapshot]) {
+      const { markdown } = await restoredRender(snapshot.snapshotId);
+      expect(markdown).toContain(before.snapshot.criteria[0].text);
+      expect(markdown).not.toContain('[object Object]');
+      expect(markdown).not.toContain('## 验收进展');
+    }
+    expect(await restoredRender(switched.snapshot.snapshotId)).toEqual(await switched.render());
     const legacyReview = (await restoredApp.inject({ url: `/api/v1/changes/${changeId}/review`, headers: restoredOwner })).json();
     expect(legacyReview.criteria[0].blockingFailures).toHaveLength(1);
     expect(legacyReview.criteria[0].dispositions.every((item: { targetId: string | null }) => item.targetId === null)).toBe(true);
@@ -667,6 +714,8 @@ describe('review confirmation and acceptance', () => {
     const changeRow = (await app.inject({ url: `/api/v1/changes/${changeId}`, headers: ownerHeaders })).json() as { phase: string; activeSession: { status: string } | null };
     expect(changeRow.phase).toBe('Accepted');
     expect(changeRow.activeSession).toBeNull();
+    const completedSnapshots = (await app.inject({ url: `/api/v1/changes/${changeId}/handoffs`, headers: ownerHeaders })).json().snapshots;
+    expect(completedSnapshots).toContainEqual(expect.objectContaining({ phase: 'Accepted', capturedVersion: complete.json().recordVersion }));
     // 已验收记录及其证据、附件和决定可在独立实例完整恢复。
     const exportStart = await app.inject({ method: 'POST', url: `/api/v1/projects/${projectId}/exports`, headers: ownerHeaders, payload: { requestId: 'review-export' } });
     expect(exportStart.statusCode).toBe(201);

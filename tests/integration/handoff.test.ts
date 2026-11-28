@@ -122,6 +122,36 @@ describe('fixed handoff snapshots', () => {
     expect(listed.snapshots.map(item => item.id).sort()).toEqual([snapshotId, second.json().resourceId].sort());
   }, 20000);
 
+  it('distinguishes a sibling worktree and a rebound workspace from the saved checkout', async () => {
+    const { app, repoDir, workspaceId, projectId, changeId, ownerHeaders, commit } = await setup();
+    const other = await mkdtemp(join(tmpdir(), 'specmill-handoff-worktree-')); dirs.push(other);
+    commit(['worktree', 'add', '--detach', other, 'HEAD']);
+    const bind = (path: string, id: string | null, requestId: string) => app.inject({
+      method: 'POST', url: `/api/v1/projects/${projectId}/workspaces`, headers: ownerHeaders,
+      payload: { requestId, expectedVersion: id ? 1 : null, payload: { workspaceId: id, path } },
+    });
+    const sibling = await bind(other, null, 'bind-sibling');
+    expect(sibling.statusCode).toBe(201);
+    const session = await startSession(app, changeId, workspaceId, 'worktree-session');
+    const observation = await observe(app, workspaceId, 'worktree-observation', session);
+    expect((await saveCheckpoint(app, changeId, 2, 'worktree-save', observation.json().resourceId, session)).statusCode).toBe(201);
+    const compare = async (id: string) => (await app.inject({
+      url: `/api/v1/changes/${changeId}/continuation/${id}`, headers: ownerHeaders,
+    })).json();
+    await writeFile(join(repoDir, 'new-work.txt'), 'work since the checkpoint');
+    const cross = await compare(sibling.json().resourceId);
+    expect(cross).toMatchObject({ comparison: 'differentWorkspace', hasUnsavedChanges: null,
+      savedObservation: { workspaceId, bindingVersion: 1 }, fresh: { workspaceId: sibling.json().resourceId } });
+    expect(cross.notice).toContain('跨工作区');
+    expect(await compare(workspaceId)).toMatchObject({ comparison: 'sameBinding', hasUnsavedChanges: true });
+    const released = await app.inject({ method: 'POST', url: `/api/v1/writer-sessions/${session.resourceId}/release`, headers: { ...agentHeaders, 'x-specmill-writer-token': 'a'.repeat(64) },
+      payload: { requestId: 'release-for-rebind', expectedVersion: 3, generation: session.generation } });
+    expect(released.statusCode).toBe(200);
+    expect((await bind(repoDir, workspaceId, 'bind-again')).statusCode).toBe(200);
+    expect(await compare(workspaceId)).toMatchObject({ comparison: 'bindingChanged', hasUnsavedChanges: null,
+      savedObservation: { bindingVersion: 1 }, fresh: { bindingVersion: 2 } });
+  }, 30000);
+
   it('compares saved progress with real files and reports unsaved work without rolling back', async () => {
     const { app, repoDir, workspaceId, changeId, commit } = await setup();
     const session = await startSession(app, changeId, workspaceId, 'cont-start');
