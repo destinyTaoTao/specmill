@@ -3,6 +3,7 @@
 // 从安装产物启动服务 → 浏览器外完成登录/项目/会话/保存/交接最小闭环。
 // 报告离线安装是否成功（失败后回退允许联网的安装）。
 import { spawn, spawnSync, execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { mkdtemp, rm, writeFile, readFile, realpath } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve, dirname } from 'node:path';
@@ -33,6 +34,7 @@ try {
   const packed = JSON.parse(tgzName)[0];
   tgzPath = resolve(workDir, packed.filename);
   log(`打包完成：${packed.filename}（${packed.size} 字节，入口数 ${packed.entryCount}）`);
+  log(`安装包 SHA-256：${createHash('sha256').update(await readFile(tgzPath)).digest('hex')}`);
   const names = packed.files.map(file => file.path);
   // 2. 内容检查：必需产物在；个人数据与开发产物不在
   const required = ['package.json', 'README.md', 'dist/index.html', 'dist-server/server/main.js', 'dist-cli/cli/main.js'];
