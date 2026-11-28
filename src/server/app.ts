@@ -14,6 +14,7 @@ import { registerHandoffs } from './features/handoffs.js';
 import { registerEvidence } from './features/evidence.js';
 import { registerReview } from './features/review.js';
 import { registerRecovery } from './features/recovery.js';
+import { cleanInterruptedRestoreStaging } from './recovery/import.js';
 import { registerProjectOverviews } from './features/project-overviews.js';
 import { registerPilot, type PilotOptions } from './pilot/routes.js';
 import { registerTeam, type TeamOptions } from './team/routes.js';
@@ -299,6 +300,8 @@ export async function buildApp(options: AppOptions) {
       db!.prepare("UPDATE export_operations SET status = 'failed', error = '服务重启中断了导出准备', finished_at = ? WHERE status = 'preparing'").run(new Date().toISOString());
     })();
     const app = Fastify({ logger: { level: 'error' }, logController: new LogController({ disableRequestLogging: true }), bodyLimit: 1024 * 1024, genReqId: () => randomUUID(), ajv: { customOptions: { removeAdditional: false, coerceTypes: false } }, forceCloseConnections: true });
+    const reportCleanupError = (error: unknown) => app.log.error({ err: error }, '恢复暂存清理未完成，下次启动将重试。');
+    await cleanInterruptedRestoreStaging(join(dir, 'attachments'), reportCleanupError).catch(reportCleanupError);
     // 附件二进制正文：按内容寻址存储，单文件上限在路由上收紧。
     app.addContentTypeParser('application/octet-stream', { parseAs: 'buffer', bodyLimit: 6 * 1024 * 1024 }, (_request, body: unknown, done: (error: Error | null, result?: unknown) => void) => {
       if (!Buffer.isBuffer(body)) return done(new Error('Invalid attachment body'));

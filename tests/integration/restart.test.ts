@@ -1,6 +1,9 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { execFile, spawn, spawnSync, type ChildProcess } from 'node:child_process';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+import { once } from 'node:events';
+import { pathToFileURL } from 'node:url';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { promisify } from 'node:util';
@@ -20,8 +23,8 @@ afterEach(async () => {
     await rm(`${dir}.lock`, { recursive: true, force: true });
   }
 });
-function startServer(dataDir: string) {
-  const child = spawn(process.execPath, ['--import', 'tsx', resolve('src/server/main.ts'), '--data-dir', dataDir, '--port', String(port)], { stdio: ['ignore', 'pipe', 'pipe'] });
+function startServer(dataDir: string, preload?: string) {
+  const child = spawn(process.execPath, [...(preload ? ['--import', pathToFileURL(resolve(preload)).href] : []), '--import', 'tsx', resolve('src/server/main.ts'), '--data-dir', dataDir, '--port', String(port)], { stdio: ['ignore', 'pipe', 'pipe'] });
   children.push(child);
   return child;
 }
@@ -83,6 +86,79 @@ async function spawnStdin(dataDir: string, args: string[], body: string) {
 }
 
 describe('real process restart', () => {
+  it('cleans interrupted restore staging, preserves official attachments and replays the same request', async () => {
+    const source = await mkdtemp(join(tmpdir(), 'specmill-interrupt-source-')); dirs.push(source);
+    const target = await mkdtemp(join(tmpdir(), 'specmill-interrupt-target-')); dirs.push(target);
+    const content = Buffer.from('Same content in two independent projects');
+    const hash = createHash('sha256').update(content).digest('hex');
+    const login = async (token: string | null) => {
+      expect(token).toBeTruthy();
+      const res = await fetch(base + '/api/v1/session', { method: 'POST', headers: { origin: base, 'content-type': 'application/json' }, body: JSON.stringify({ token }) });
+      expect(res.status).toBe(200);
+      return { origin: base, cookie: res.headers.get('set-cookie')!.split(';')[0], 'x-specmill-request': '1' };
+    };
+    let headers = await login(await waitOwnerToken(startServer(source)));
+    const post = (path: string, data: Record<string, unknown> | Buffer) => fetch(base + '/api/v1' + path, {
+      method: 'POST', headers: { ...headers, 'content-type': Buffer.isBuffer(data) ? 'application/octet-stream' : 'application/json' },
+      body: Buffer.isBuffer(data) ? new Uint8Array(data) : JSON.stringify(data),
+    });
+    const projectWithAttachment = async (name: string) => {
+      const res = await post('/projects', { name, requestId: name });
+      expect(res.status).toBe(201);
+      const project = (await res.json()).resourceId;
+      const upload = await post(`/projects/${project}/attachments?requestId=upload-${name}&filename=evidence.log`, content);
+      expect(upload.status).toBe(201);
+      return { project, attachment: (await upload.json()).resourceId };
+    };
+    const original = await projectWithAttachment('source');
+    const exported = await post(`/projects/${original.project}/exports`, { requestId: 'export' });
+    expect(exported.status).toBe(201);
+    const exportUrl = base + '/api/v1/exports/' + (await exported.json()).resourceId;
+    expect((await (await fetch(exportUrl, { headers })).json()).status).toBe('ready');
+    const download = await fetch(exportUrl + '/download', { headers });
+    expect(download.status).toBe(200);
+    const zip = Buffer.from(await download.arrayBuffer());
+    await stopServer();
+
+    const child = startServer(target, 'tests/fixtures/pause-staged-restore.mjs');
+    headers = await login(await waitOwnerToken(child));
+    const keeper = await projectWithAttachment('keeper');
+    const attachments = join(target, 'attachments');
+    const officialDir = join(attachments, keeper.project);
+    const staged = once(child.stdout!, 'data');
+    const retry = () => post('/restore?requestId=interrupted-restore', zip);
+    const interrupted = retry().then(res => res.status, () => 'disconnected');
+    expect(String((await staged)[0])).toContain('restore-staged');
+    const stage = (await readdir(attachments)).find(name => name.startsWith('.restore-'))!;
+    expect(await readFile(join(attachments, stage, hash))).toEqual(content);
+    const exit = once(child, 'exit');
+    child.kill('SIGKILL');
+    await exit;
+    expect(await interrupted).toBe('disconnected');
+
+    const alias = join(attachments, '.restore-ABC123');
+    await symlink(officialDir, alias, process.platform === 'win32' ? 'junction' : 'dir');
+    const foreign = await mkdtemp(join(attachments, '.restore-'));
+    await mkdir(join(foreign, 'unrelated'));
+    headers = await login(await startServerAfterLock(target));
+    await expect(readdir(join(attachments, stage))).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(await readFile(join(alias, hash))).toEqual(content);
+    expect(await readdir(foreign)).toContain('unrelated');
+    const receiptUrl = base + '/api/v1/restores/interrupted-restore';
+    expect((await fetch(receiptUrl, { headers })).status).toBe(404);
+    expect((await fetch(base + '/api/v1/projects/' + original.project + '/capacity', { headers })).status).toBe(404);
+    const restored = await retry();
+    expect(restored.status).toBe(201);
+    const receipt = await restored.json();
+    expect(receipt.restoredProjectId).toBe(original.project);
+    expect(await (await fetch(receiptUrl, { headers })).json()).toEqual(receipt);
+    expect(await (await retry()).json()).toEqual(receipt);
+    for (const { attachment } of [keeper, original]) {
+      const result = await fetch(base + '/api/v1/attachments/' + attachment, { headers });
+      expect(result.status).toBe(200);
+      expect(Buffer.from(await result.arrayBuffer())).toEqual(content);
+    }
+  }, 90000);
   it('invalidates grants across a real restart and replays the delayed CLI write-back', async () => {
     const dataDir = await mkdtemp(join(tmpdir(), 'specmill-restart-data-')); dirs.push(dataDir);
     const repoDir = await mkdtemp(join(tmpdir(), 'specmill-restart-repo-')); dirs.push(repoDir);

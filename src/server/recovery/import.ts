@@ -1,6 +1,6 @@
 import type Database from 'better-sqlite3';
 import { createHash } from 'node:crypto';
-import { mkdir, mkdtemp, open, readFile, rmdir, unlink, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, mkdtemp, open, readFile, readdir, rmdir, unlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { parseZip, ZipFormatError } from './zip.js';
 import { projectRecordBytes, ProjectCapacityExceeded } from '../storage/project-capacity.js';
@@ -9,6 +9,30 @@ import { requestIdUsedElsewhere } from '../storage/request-ids.js';
 type ImportFailure = { code: string; message: string };
 type ImportSuccess = { projectId: string; counts: Record<string, number>; committedAt: string };
 class RestoreRequestConflict extends Error {}
+
+const stagingPrefix = '.restore-';
+
+// Called with the data directory locked, before the service accepts requests.
+export async function cleanInterruptedRestoreStaging(attachmentsDir: string, onError: (error: unknown) => void) {
+  const root = await lstat(attachmentsDir).catch((error: NodeJS.ErrnoException) => {
+    if (error.code !== 'ENOENT') throw error;
+  });
+  if (!root?.isDirectory()) return;
+  for (const entry of await readdir(attachmentsDir, { withFileTypes: true })) {
+    if (!entry.isDirectory() || !entry.name.startsWith(stagingPrefix) ||
+        !/^[a-zA-Z0-9]{6}$/.test(entry.name.slice(stagingPrefix.length))) continue;
+    const stage = join(attachmentsDir, entry.name);
+    try {
+      const files = await readdir(stage, { withFileTypes: true });
+      // A stage contains only flat SHA-256 files (possibly partially written).
+      // Leave unfamiliar directories, symlinks and their contents alone.
+      if (!files.every(file => file.isFile() && /^[0-9a-f]{64}$/.test(file.name))) continue;
+      for (const file of files) await unlink(join(stage, file.name));
+      await rmdir(stage);
+    } catch (error) { onError(error); }
+  }
+}
+
 export function getRestoreReceipt(db: Database.Database, requestId: string) {
   const row = db.prepare('SELECT package_sha256 AS packageSha256, project_id AS projectId, counts_json AS countsJson, committed_at AS committedAt FROM restore_receipts WHERE request_id = ?').get(requestId) as { packageSha256: string; projectId: string; countsJson: string; committedAt: string } | undefined;
   return row ? { packageSha256: row.packageSha256, projectId: row.projectId, counts: JSON.parse(row.countsJson) as Record<string, number>, committedAt: row.committedAt } : null;
@@ -260,7 +284,7 @@ async function restorePackage(db: Database.Database, attachmentsDir: string, zip
   for (const name of entries.keys()) if (name.startsWith('attachments/') && !expectedAttachments.has(name)) return { code: 'INVALID_PACKAGE', message: `恢复包包含无记录的附件：${name}` };
   // 每次恢复使用独立暂存目录，只清理本次独占创建的文件。
   await mkdir(attachmentsDir, { recursive: true });
-  const stagingDir = await mkdtemp(join(attachmentsDir, '.restore-'));
+  const stagingDir = await mkdtemp(join(attachmentsDir, stagingPrefix));
   const staged: string[] = [];
   const created: string[] = [];
   let activated = false;

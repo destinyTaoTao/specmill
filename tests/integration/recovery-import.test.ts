@@ -1,11 +1,12 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { spawnSync } from 'node:child_process';
-import { mkdir, mkdtemp, readFile, readdir, realpath, rm, rmdir, stat, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, realpath, rm, rmdir, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { buildApp } from '../../src/server/app.js';
 import Database from 'better-sqlite3';
 import { buildZip } from '../../src/server/recovery/zip.js';
+import { cleanInterruptedRestoreStaging } from '../../src/server/recovery/import.js';
 import { createHash } from 'node:crypto';
 
 vi.mock('node:fs/promises', async importOriginal => {
@@ -75,6 +76,26 @@ function readZipEntries(zip: Buffer): Map<string, Buffer> {
 }
 
 describe('restore from recovery package', () => {
+  it('never follows a linked attachment root and retries a failed staging cleanup', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'specmill-staging-')); dirs.push(root);
+    const attachments = join(root, 'attachments');
+    await mkdir(attachments);
+    const alias = join(root, 'alias');
+    await symlink(attachments, alias, process.platform === 'win32' ? 'junction' : 'dir');
+    const stage = await mkdtemp(join(attachments, '.restore-'));
+    const partial = join(stage, 'a'.repeat(64));
+    await writeFile(partial, 'incomplete');
+    const onError = vi.fn();
+    await cleanInterruptedRestoreStaging(alias, onError);
+    expect(await readFile(partial, 'utf8')).toBe('incomplete');
+    const busy = Object.assign(new Error('locked test directory'), { code: 'EBUSY' });
+    vi.mocked(rmdir).mockRejectedValueOnce(busy);
+    await cleanInterruptedRestoreStaging(attachments, onError);
+    expect(onError).toHaveBeenCalledExactlyOnceWith(busy);
+    expect(await readdir(stage)).toEqual([]);
+    await cleanInterruptedRestoreStaging(attachments, onError);
+    await expect(stat(stage)).rejects.toMatchObject({ code: 'ENOENT' });
+  });
   it('persists one recovery receipt atomically and replays it after restart', async () => {
     const source = await setup(43218, undefined, 'receipt-atomic-source');
     const exported = await source.app.inject({ method: 'POST', url: `/api/v1/projects/${source.projectId}/exports`, headers: agentHeaders, payload: { requestId: 'receipt-atomic-export' } });
